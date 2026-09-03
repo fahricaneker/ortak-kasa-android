@@ -340,3 +340,309 @@ h1, h2, h3, p { margin: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+
+/* === Gelişmiş iş / müşteri / kısmi ödeme paketi === */
+.job-filter-card {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  background: #ffffff;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.05);
+}
+
+.job-filter-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.job-filter-head > div {
+  display: grid;
+  gap: 4px;
+}
+
+.job-filter-head strong {
+  font-size: 16px;
+  color: #0f172a;
+}
+
+.job-filter-head span {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.job-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.job-filter-grid label {
+  display: grid;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #475569;
+}
+
+.job-filter-grid input {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  padding: 0 12px;
+  background: #fff;
+  color: #0f172a;
+}
+
+.job-summary-grid,
+.customer-summary-grid,
+.payment-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.job-summary-box,
+.payment-overview > div {
+  display: grid;
+  gap: 4px;
+  padding: 13px 14px;
+  border-radius: 14px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.job-summary-box span,
+.payment-overview span {
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.job-summary-box strong,
+.payment-overview strong {
+  color: #0f172a;
+  font-size: 17px;
+}
+
+.job-summary-box.positive {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+}
+
+.job-summary-box.positive strong {
+  color: #047857;
+}
+
+.job-summary-box.warning {
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+
+.job-summary-box.warning strong {
+  color: #c2410c;
+}
+
+.customer-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.customer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid #dbe3ee;
+  border-radius: 999px;
+  padding: 9px 12px;
+  background: #fff;
+  color: #334155;
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.customer-chip:active {
+  transform: scale(0.98);
+}
+
+.job-payment-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  margin: 12px 0 4px;
+}
+
+.job-payment-grid span {
+  display: grid;
+  gap: 2px;
+  padding: 9px 10px;
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+.job-payment-grid small {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.job-payment-grid b {
+  color: #0f172a;
+  font-size: 14px;
+}
+
+.job-card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.job-card-actions .button {
+  flex: 1;
+}
+
+.button-danger-outline {
+  background: #fff;
+  color: #b91c1c;
+  border: 1px solid #fecaca;
+}
+
+.danger-icon {
+  color: #b91c1c !important;
+  border-color: #fecaca !important;
+  background: #fff7f7 !important;
+}
+
+.cash-row-end {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.row-copy-button {
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 0;
+  min-width: 0;
+  color: inherit;
+}
+
+.clickable-card {
+  cursor: pointer;
+}
+
+.customer-history {
+  display: grid;
+  gap: 22px;
+}
+
+.customer-history-list {
+  display: grid;
+  gap: 8px;
+}
+
+.customer-history-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.customer-history-row > span:first-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.customer-history-row strong {
+  color: #0f172a;
+}
+
+.customer-history-row small {
+  color: #64748b;
+  line-height: 1.4;
+}
+
+.customer-history-end {
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+
+.customer-history-end b {
+  font-size: 13px;
+  color: #c2410c;
+}
+
+.customer-history-end button {
+  border: 0;
+  background: transparent;
+  color: #047857;
+  font-weight: 800;
+  padding: 2px 0;
+}
+
+.positive {
+  color: #047857;
+}
+
+@media (max-width: 760px) {
+  .job-filter-head {
+    align-items: flex-start;
+  }
+
+  .job-filter-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .job-filter-grid .button {
+    grid-column: 1 / -1;
+  }
+
+  .job-summary-grid,
+  .customer-summary-grid,
+  .payment-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .job-card-actions {
+    flex-direction: column;
+  }
+
+  .customer-history-row {
+    align-items: flex-start;
+  }
+
+  .cash-row-end {
+    gap: 4px;
+  }
+}
+
+@media (max-width: 480px) {
+  .job-filter-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .job-filter-grid .button {
+    grid-column: auto;
+  }
+
+  .job-filter-head {
+    flex-direction: column;
+  }
+
+  .job-filter-head .button {
+    width: 100%;
+  }
+}

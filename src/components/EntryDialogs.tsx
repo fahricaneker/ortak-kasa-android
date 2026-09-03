@@ -1,4 +1,4 @@
-import { type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 
 import type { Job, Partner } from "../types";
 import { localDateKey, money, parseMoney } from "../lib/utils";
@@ -120,6 +120,7 @@ export function AdvanceDialog({
 
 export function JobDialog({
   partners,
+  customers,
   open,
   busy,
   onClose,
@@ -127,6 +128,7 @@ export function JobDialog({
   onInvalid,
 }: {
   partners: Partner[];
+  customers: string[];
   open: boolean;
   busy: boolean;
   onClose: () => void;
@@ -141,10 +143,23 @@ export function JobDialog({
     note: string;
   }) => Promise<void>;
 }) {
+  const [customerChoice, setCustomerChoice] = useState("__new__");
+
+  useEffect(() => {
+    if (open) setCustomerChoice(customers[0] ?? "__new__");
+  }, [open, customers]);
+
   const submit = (event: FormEvent<HTMLFormElement>) => {
     const values = valuesFrom(event);
     const amountCents = parseMoney(String(values.amount));
     const serviceFeeCents = parseMoney(String(values.serviceFee), true);
+    const selected = String(values.customerChoice);
+    const customerName = selected === "__new__" ? String(values.customerName ?? "").trim() : selected;
+
+    if (!customerName) {
+      onInvalid("Müşteri seçin veya yeni müşteri adını yazın.");
+      return;
+    }
     if (amountCents === null) {
       onInvalid("Alınacak tutarı kontrol edin.");
       return;
@@ -153,8 +168,9 @@ export function JobDialog({
       onInvalid("Servis / araç payını kontrol edin.");
       return;
     }
+
     void onSave({
-      customerName: String(values.customerName),
+      customerName,
       title: String(values.title),
       amountCents,
       plannedDate: String(values.plannedDate),
@@ -165,14 +181,33 @@ export function JobDialog({
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="Yeni iş ekle" description="Ödeme gelene kadar iş otomatik olarak bugüne devreder.">
+    <Modal open={open} onClose={onClose} title="Yeni iş ekle" description="Kayıtlı müşteriyi seçin veya yeni müşteri ekleyin.">
       <form className="form-stack" onSubmit={submit}>
+        <Field label="Kayıtlı müşteri" htmlFor="job-customer-choice">
+          <select
+            id="job-customer-choice"
+            name="customerChoice"
+            value={customerChoice}
+            onChange={(event) => setCustomerChoice(event.target.value)}
+          >
+            {customers.map((customer) => <option key={customer} value={customer}>{customer}</option>)}
+            <option value="__new__">+ Yeni müşteri</option>
+          </select>
+        </Field>
+
+        {customerChoice === "__new__" && (
+          <Field label="Yeni müşteri adı" htmlFor="job-customer">
+            <input id="job-customer" name="customerName" required maxLength={80} placeholder="Müşteri adı" autoFocus />
+          </Field>
+        )}
+
         <div className="form-grid">
-          <Field label="Müşteri" htmlFor="job-customer"><input id="job-customer" name="customerName" required maxLength={80} placeholder="Müşteri adı" autoFocus /></Field>
           <Field label="Alınacak tutar (₺)" htmlFor="job-amount"><input id="job-amount" name="amount" required inputMode="decimal" placeholder="0,00" /></Field>
+          <Field label="İş tarihi" htmlFor="job-date"><input id="job-date" name="plannedDate" type="date" required defaultValue={localDateKey()} /></Field>
         </div>
+
         <Field label="Yapılacak iş" htmlFor="job-title"><input id="job-title" name="title" required maxLength={100} placeholder="Örn. personel servisi" /></Field>
-        <Field label="İş tarihi" htmlFor="job-date"><input id="job-date" name="plannedDate" type="date" required defaultValue={localDateKey()} /></Field>
+
         <div className="form-grid">
           <Field label="Kullanılan araç" htmlFor="job-vehicle">
             <select id="job-vehicle" name="vehiclePartnerId" defaultValue="none">
@@ -182,6 +217,7 @@ export function JobDialog({
           </Field>
           <Field label="Servis / araç payı (₺)" htmlFor="job-service"><input id="job-service" name="serviceFee" inputMode="decimal" defaultValue="0" /></Field>
         </div>
+
         <Field label="Not (isteğe bağlı)" htmlFor="job-note"><textarea id="job-note" name="note" maxLength={240} rows={3} placeholder="Adres, saat veya kısa açıklama" /></Field>
         <FormActions busy={busy} onCancel={onClose} submitLabel="İşi kaydet" />
       </form>
@@ -194,23 +230,65 @@ export function PaymentDialog({
   busy,
   onClose,
   onSave,
+  onInvalid,
 }: {
   job: Job | null;
   busy: boolean;
   onClose: () => void;
-  onSave: (jobId: string, paidDate: string) => Promise<void>;
+  onInvalid: (message: string) => void;
+  onSave: (jobId: string, amountCents: number, paidDate: string, note: string) => Promise<void>;
 }) {
+  const remaining = job ? Math.max(0, job.amountCents - job.paidCents) : 0;
+
   const submit = (event: FormEvent<HTMLFormElement>) => {
     const values = valuesFrom(event);
-    if (job) void onSave(job.id, String(values.paidDate));
+    if (!job) return;
+
+    const amountCents = parseMoney(String(values.amount));
+    if (amountCents === null) {
+      onInvalid("Geçerli bir ödeme tutarı yazın.");
+      return;
+    }
+    if (amountCents > remaining) {
+      onInvalid(`Ödeme kalan tutarı geçemez. Kalan ${money(remaining)}.`);
+      return;
+    }
+
+    void onSave(job.id, amountCents, String(values.paidDate), String(values.note));
   };
+
+  const defaultAmount = (remaining / 100).toFixed(2).replace(".", ",");
+
   return (
-    <Modal open={Boolean(job)} onClose={onClose} title="Ödeme alındı" description={job ? `${job.customerName} · ${money(job.amountCents)}` : undefined}>
+    <Modal
+      open={Boolean(job)}
+      onClose={onClose}
+      title="Ödeme al"
+      description={job ? `${job.customerName} · ${job.title}` : undefined}
+    >
       {job && (
         <form className="form-stack" onSubmit={submit}>
-          <div className="success-box"><strong>Tek işlemle iki kayıt</strong><span>İş seçilen tarihte tamamlanır ve tutar aynı güne gelir olarak eklenir.</span></div>
-          <Field label="Müşterinin ödeme yaptığı gün" htmlFor="paid-date"><input id="paid-date" name="paidDate" type="date" required defaultValue={localDateKey()} autoFocus /></Field>
-          <FormActions busy={busy} onCancel={onClose} submitLabel="Ödendi ve bitir" />
+          <div className="payment-overview">
+            <div><span>İş toplamı</span><strong>{money(job.amountCents)}</strong></div>
+            <div><span>Alınan</span><strong>{money(job.paidCents)}</strong></div>
+            <div><span>Kalan</span><strong>{money(remaining)}</strong></div>
+          </div>
+
+          <Field label="Bu sefer alınan tutar (₺)" htmlFor="paid-amount">
+            <input id="paid-amount" name="amount" required inputMode="decimal" defaultValue={defaultAmount} autoFocus />
+          </Field>
+          <Field label="Ödeme tarihi" htmlFor="paid-date">
+            <input id="paid-date" name="paidDate" type="date" required defaultValue={localDateKey()} />
+          </Field>
+          <Field label="Ödeme notu (isteğe bağlı)" htmlFor="paid-note">
+            <textarea id="paid-note" name="note" maxLength={240} rows={2} placeholder="Örn. havale, nakit, 1. taksit" />
+          </Field>
+
+          <div className="success-box">
+            <strong>Kısmi ödeme desteklenir</strong>
+            <span>Girilen tutar kasaya gelir olur. Kalan borç sıfır olduğunda iş otomatik tamamlanır.</span>
+          </div>
+          <FormActions busy={busy} onCancel={onClose} submitLabel={remaining === job.amountCents ? "Ödemeyi kaydet" : "Yeni ödemeyi kaydet"} />
         </form>
       )}
     </Modal>

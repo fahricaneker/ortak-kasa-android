@@ -9,11 +9,13 @@ import {
   addAdvance,
   addCashEntry,
   addJob,
+  addJobPayment,
   createCompany,
+  deleteCashEntry,
+  deleteJob,
   joinCompany,
   login,
   logout,
-  markJobPaid,
   register,
   resetPassword,
   subscribeCompany,
@@ -156,7 +158,10 @@ export default function App() {
   const handleAddCash = (entry: NewCashEntry) => withBusy(() => addCashEntry(requireProfile(), entry));
   const handleAddAdvance = (entry: NewAdvance) => withBusy(() => addAdvance(requireProfile(), entry));
   const handleAddJob = (entry: NewJob) => withBusy(() => addJob(requireProfile(), entry));
-  const handleMarkPaid = (jobId: string, paidDate: string) => withBusy(() => markJobPaid(requireProfile(), jobId, paidDate));
+  const handleAddPayment = (jobId: string, amountCents: number, paidDate: string, note: string) =>
+    withBusy(() => addJobPayment(requireProfile(), jobId, amountCents, paidDate, note));
+  const handleDeleteJob = (jobId: string) => withBusy(() => deleteJob(requireProfile(), jobId));
+  const handleDeleteCash = (entryId: string) => withBusy(() => deleteCashEntry(requireProfile(), entryId));
 
   let content;
   if (!firebaseConfigured) {
@@ -176,7 +181,9 @@ export default function App() {
         onAddCash={handleAddCash}
         onAddAdvance={handleAddAdvance}
         onAddJob={handleAddJob}
-        onMarkPaid={handleMarkPaid}
+        onAddPayment={handleAddPayment}
+        onDeleteJob={handleDeleteJob}
+        onDeleteCash={handleDeleteCash}
         onLogout={handleLogout}
         notify={notify}
       />

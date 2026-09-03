@@ -12,10 +12,14 @@ import {
   addDoc,
   collection,
   doc,
+  getDocs,
   onSnapshot,
+  query,
   runTransaction,
   serverTimestamp,
   setDoc,
+  where,
+  writeBatch,
   type DocumentData,
   type QueryDocumentSnapshot,
   type Unsubscribe,
@@ -49,6 +53,42 @@ function clean(value: string, max: number) {
 
 function withId<T>(snapshot: QueryDocumentSnapshot<DocumentData>) {
   return { id: snapshot.id, ...snapshot.data() } as T;
+}
+
+function normalizeJob(raw: Omit<Job, "vehiclePartnerName">): Omit<Job, "vehiclePartnerName"> {
+  const legacy = raw as Omit<Job, "vehiclePartnerName"> & {
+    originalAmountCents?: number;
+    paidAmountCents?: number;
+  };
+  const storedAmount = Number(raw.amountCents ?? 0);
+  const originalAmount = Number.isInteger(legacy.originalAmountCents) && Number(legacy.originalAmountCents) > 0
+    ? Number(legacy.originalAmountCents)
+    : storedAmount;
+  const legacyPaid = Number.isInteger(legacy.paidAmountCents) && Number(legacy.paidAmountCents) > 0
+    ? Number(legacy.paidAmountCents)
+    : raw.status === "paid"
+      ? originalAmount
+      : 0;
+  const paidCents = Math.max(
+    0,
+    Math.min(originalAmount, Number.isInteger(raw.paidCents) ? Number(raw.paidCents) : legacyPaid),
+  );
+  const status: Job["status"] =
+    paidCents >= originalAmount && originalAmount > 0
+      ? "paid"
+      : paidCents > 0
+        ? "partial"
+        : raw.status === "paid"
+          ? "paid"
+          : "open";
+
+  return {
+    ...raw,
+    amountCents: originalAmount,
+    paidCents: status === "paid" ? originalAmount : paidCents,
+    status,
+    paidDate: status === "paid" ? raw.paidDate ?? raw.plannedDate : null,
+  };
 }
 
 export async function register(email: string, password: string, displayName: string) {
@@ -229,7 +269,7 @@ export function subscribeCompany(
       partnerName: partnerNames.get(item.partnerId) ?? "Ortak",
     }));
     const jobs = jobRecords.map((item) => ({
-      ...item,
+      ...normalizeJob(item),
       vehiclePartnerName: item.vehiclePartnerId
         ? partnerNames.get(item.vehiclePartnerId) ?? "Ortak"
         : null,
@@ -268,7 +308,8 @@ export function subscribeCompany(
   unsubs.push(onSnapshot(collection(db, "companies", companyId, "jobs"), (snapshot) => {
     jobRecords = snapshot.docs
       .map((item) => withId<Omit<Job, "vehiclePartnerName">>(item))
-      .sort((a, b) => (a.status === b.status ? b.plannedDate.localeCompare(a.plannedDate) : a.status === "open" ? -1 : 1));
+      .map(normalizeJob)
+      .sort((a, b) => (a.status === b.status ? b.plannedDate.localeCompare(a.plannedDate) : a.status === "paid" ? 1 : -1));
     emit();
   }, onError));
 
@@ -305,6 +346,7 @@ export async function addJob(profile: UserProfile, entry: NewJob) {
     customerName: clean(entry.customerName, 80),
     title: clean(entry.title, 100),
     note: clean(entry.note, 240),
+    paidCents: 0,
     status: "open",
     paidDate: null,
     createdBy: profile.uid,
@@ -313,34 +355,121 @@ export async function addJob(profile: UserProfile, entry: NewJob) {
   });
 }
 
-export async function markJobPaid(profile: UserProfile, jobId: string, paidDate: string) {
+export async function addJobPayment(
+  profile: UserProfile,
+  jobId: string,
+  amountCents: number,
+  paidDate: string,
+  note: string,
+) {
   const { db } = requireFirebase();
   const jobRef = doc(db, "companies", profile.companyId, "jobs", jobId);
-  const incomeRef = doc(db, "companies", profile.companyId, "cashEntries", `job_${jobId}`);
+  const paymentRef = doc(collection(db, "companies", profile.companyId, "cashEntries"));
 
   await runTransaction(db, async (transaction) => {
     const snapshot = await transaction.get(jobRef);
     if (!snapshot.exists()) throw new Error("İş kaydı bulunamadı.");
-    const job = snapshot.data() as Job;
-    if (job.status === "paid") throw new Error("Bu iş zaten ödenmiş.");
 
-    transaction.update(jobRef, {
-      status: "paid",
-      paidDate,
-      updatedAt: serverTimestamp(),
-    });
-    transaction.set(incomeRef, {
+    const raw = snapshot.data() as Job & { originalAmountCents?: number; paidAmountCents?: number };
+    const storedAmount = Number(raw.amountCents ?? 0);
+    const jobAmount = Number.isInteger(raw.originalAmountCents) && Number(raw.originalAmountCents) > 0
+      ? Number(raw.originalAmountCents)
+      : storedAmount;
+    const legacyPaid = Number.isInteger(raw.paidAmountCents) && Number(raw.paidAmountCents) > 0
+      ? Number(raw.paidAmountCents)
+      : raw.status === "paid"
+        ? jobAmount
+        : 0;
+    const currentPaid = Math.max(
+      0,
+      Math.min(jobAmount, Number.isInteger(raw.paidCents) ? Number(raw.paidCents) : legacyPaid),
+    );
+    if (raw.status === "paid" || currentPaid >= jobAmount) throw new Error("Bu iş zaten tamamen ödenmiş.");
+    if (!Number.isInteger(amountCents) || amountCents <= 0) throw new Error("Geçerli bir ödeme tutarı yazın.");
+
+    const remaining = jobAmount - currentPaid;
+    if (amountCents > remaining) {
+      throw new Error(`Ödeme kalan tutarı geçemez. Kalan: ${(remaining / 100).toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₺`);
+    }
+
+    const nextPaid = currentPaid + amountCents;
+    const fullyPaid = nextPaid >= jobAmount;
+    const now = serverTimestamp();
+
+    transaction.set(paymentRef, {
       kind: "income",
-      amountCents: job.amountCents,
+      amountCents,
       category: "İş ödemesi",
-      counterparty: job.customerName,
-      note: `${job.title} işi tamamlandı`,
+      counterparty: clean(raw.customerName, 80),
+      note: clean(note, 240) || `${clean(raw.title, 100)} işi ödemesi`,
       entryDate: paidDate,
       jobId,
       createdBy: profile.uid,
-      createdAt: serverTimestamp(),
+      createdAt: now,
+    });
+
+    transaction.update(jobRef, {
+      amountCents: jobAmount,
+      paidCents: nextPaid,
+      status: fullyPaid ? "paid" : "partial",
+      paidDate: fullyPaid ? paidDate : null,
+      updatedAt: now,
     });
   });
+}
+
+export async function deleteCashEntry(profile: UserProfile, entryId: string) {
+  const { db } = requireFirebase();
+  const entryRef = doc(db, "companies", profile.companyId, "cashEntries", entryId);
+
+  await runTransaction(db, async (transaction) => {
+    const entrySnapshot = await transaction.get(entryRef);
+    if (!entrySnapshot.exists()) return;
+    const entry = entrySnapshot.data() as CashEntry;
+
+    if (entry.jobId && entry.kind === "income") {
+      const jobRef = doc(db, "companies", profile.companyId, "jobs", entry.jobId);
+      const jobSnapshot = await transaction.get(jobRef);
+      if (jobSnapshot.exists()) {
+        const raw = jobSnapshot.data() as Job & { originalAmountCents?: number; paidAmountCents?: number };
+        const storedAmount = Number(raw.amountCents ?? 0);
+        const amountCents = Number.isInteger(raw.originalAmountCents) && Number(raw.originalAmountCents) > 0
+          ? Number(raw.originalAmountCents)
+          : storedAmount;
+        const legacyPaid = Number.isInteger(raw.paidAmountCents) && Number(raw.paidAmountCents) > 0
+          ? Number(raw.paidAmountCents)
+          : raw.status === "paid"
+            ? amountCents
+            : 0;
+        const currentPaid = Math.max(
+          0,
+          Math.min(amountCents, Number.isInteger(raw.paidCents) ? Number(raw.paidCents) : legacyPaid),
+        );
+        const nextPaid = Math.max(0, currentPaid - Number(entry.amountCents ?? 0));
+        transaction.update(jobRef, {
+          amountCents,
+          paidCents: nextPaid,
+          status: nextPaid <= 0 ? "open" : nextPaid >= amountCents ? "paid" : "partial",
+          paidDate: nextPaid >= amountCents ? raw.paidDate ?? entry.entryDate : null,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
+
+    transaction.delete(entryRef);
+  });
+}
+
+export async function deleteJob(profile: UserProfile, jobId: string) {
+  const { db } = requireFirebase();
+  const cashRef = collection(db, "companies", profile.companyId, "cashEntries");
+  const linked = await getDocs(query(cashRef, where("jobId", "==", jobId)));
+  if (linked.size > 450) throw new Error("Bu işe bağlı çok fazla ödeme var. Destek için kayıtları bölerek silin.");
+
+  const batch = writeBatch(db);
+  linked.docs.forEach((item) => batch.delete(item.ref));
+  batch.delete(doc(db, "companies", profile.companyId, "jobs", jobId));
+  await batch.commit();
 }
 
 export async function saveProfileName(profile: UserProfile, displayName: string) {

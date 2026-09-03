@@ -49,12 +49,13 @@ export type Job = {
   customerName: string;
   title: string;
   amountCents: number;
+  paidCents: number;
   plannedDate: string;
   vehiclePartnerId: string | null;
   vehiclePartnerName: string | null;
   serviceFeeCents: number;
   note: string;
-  status: "open" | "paid";
+  status: "open" | "partial" | "paid";
   paidDate: string | null;
 };
 
@@ -68,4 +69,4 @@ export type CompanyData = {
 
 export type NewCashEntry = Omit<CashEntry, "id" | "jobId">;
 export type NewAdvance = Omit<Advance, "id" | "partnerName">;
-export type NewJob = Omit<Job, "id" | "vehiclePartnerName" | "status" | "paidDate">;
+export type NewJob = Omit<Job, "id" | "vehiclePartnerName" | "status" | "paidDate" | "paidCents">;
