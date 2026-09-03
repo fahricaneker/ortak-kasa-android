@@ -12,7 +12,9 @@ import {
   addDoc,
   collection,
   doc,
+  getDoc,
   getDocs,
+  increment,
   onSnapshot,
   query,
   runTransaction,
@@ -27,9 +29,12 @@ import {
 
 import type {
   Advance,
+  AuditLog,
   CashEntry,
   Company,
   CompanyData,
+  CompanySettingsInput,
+  CustomerAccount,
   Job,
   NewAdvance,
   NewCashEntry,
@@ -55,10 +60,19 @@ function withId<T>(snapshot: QueryDocumentSnapshot<DocumentData>) {
   return { id: snapshot.id, ...snapshot.data() } as T;
 }
 
+function normalizedCustomer(value: string) {
+  return clean(value, 80).toLocaleLowerCase("tr-TR");
+}
+
+function customerAccountId(value: string) {
+  return encodeURIComponent(normalizedCustomer(value)).slice(0, 1400) || "musteri";
+}
+
 function normalizeJob(raw: Omit<Job, "vehiclePartnerName">): Omit<Job, "vehiclePartnerName"> {
   const legacy = raw as Omit<Job, "vehiclePartnerName"> & {
     originalAmountCents?: number;
     paidAmountCents?: number;
+    creditAppliedCents?: number;
   };
   const storedAmount = Number(raw.amountCents ?? 0);
   const originalAmount = Number.isInteger(legacy.originalAmountCents) && Number(legacy.originalAmountCents) > 0
@@ -73,6 +87,10 @@ function normalizeJob(raw: Omit<Job, "vehiclePartnerName">): Omit<Job, "vehicleP
     0,
     Math.min(originalAmount, Number.isInteger(raw.paidCents) ? Number(raw.paidCents) : legacyPaid),
   );
+  const creditAppliedCents = Math.max(
+    0,
+    Math.min(paidCents, Number.isInteger(legacy.creditAppliedCents) ? Number(legacy.creditAppliedCents) : 0),
+  );
   const status: Job["status"] =
     paidCents >= originalAmount && originalAmount > 0
       ? "paid"
@@ -86,9 +104,29 @@ function normalizeJob(raw: Omit<Job, "vehiclePartnerName">): Omit<Job, "vehicleP
     ...raw,
     amountCents: originalAmount,
     paidCents: status === "paid" ? originalAmount : paidCents,
+    creditAppliedCents,
     status,
     paidDate: status === "paid" ? raw.paidDate ?? raw.plannedDate : null,
   };
+}
+
+function writeAudit(
+  profile: UserProfile,
+  action: AuditLog["action"],
+  entityType: AuditLog["entityType"],
+  summary: string,
+) {
+  const { db } = requireFirebase();
+  void addDoc(collection(db, "companies", profile.companyId, "auditLogs"), {
+    action,
+    entityType,
+    summary: clean(summary, 240),
+    actorUid: profile.uid,
+    actorName: clean(profile.displayName || profile.email || "Kullanıcı", 80),
+    eventDate: new Date().toISOString(),
+    createdBy: profile.uid,
+    createdAt: serverTimestamp(),
+  }).catch((error) => console.warn("İşlem geçmişi kaydedilemedi", error));
 }
 
 export async function register(email: string, password: string, displayName: string) {
@@ -165,6 +203,12 @@ export async function createCompany(
       name: companyName,
       inviteCode: code,
       ownerUid: user.uid,
+      phone: "",
+      email: "",
+      address: "",
+      taxOffice: "",
+      taxNumber: "",
+      logoDataUrl: "",
       createdAt: now,
     });
     transaction.set(ownerRef, {
@@ -260,6 +304,8 @@ export function subscribeCompany(
   let cashEntries: CashEntry[] = [];
   let advanceRecords: Omit<Advance, "partnerName">[] = [];
   let jobRecords: Omit<Job, "vehiclePartnerName">[] = [];
+  let customerAccounts: CustomerAccount[] = [];
+  let auditLogs: AuditLog[] = [];
 
   const emit = () => {
     if (!company) return;
@@ -274,7 +320,7 @@ export function subscribeCompany(
         ? partnerNames.get(item.vehiclePartnerId) ?? "Ortak"
         : null,
     }));
-    onValue({ company, partners, cashEntries, advances, jobs });
+    onValue({ company, partners, cashEntries, advances, jobs, customerAccounts, auditLogs });
   };
   const unsubs: Unsubscribe[] = [];
 
@@ -313,6 +359,22 @@ export function subscribeCompany(
     emit();
   }, onError));
 
+  unsubs.push(onSnapshot(collection(db, "companies", companyId, "customerAccounts"), (snapshot) => {
+    customerAccounts = snapshot.docs
+      .map((item) => withId<CustomerAccount>(item))
+      .map((item) => ({ ...item, creditCents: Math.max(0, Number(item.creditCents ?? 0)) }))
+      .sort((a, b) => a.customerName.localeCompare(b.customerName, "tr"));
+    emit();
+  }, onError));
+
+  unsubs.push(onSnapshot(collection(db, "companies", companyId, "auditLogs"), (snapshot) => {
+    auditLogs = snapshot.docs
+      .map((item) => withId<AuditLog>(item))
+      .sort((a, b) => String(b.eventDate ?? "").localeCompare(String(a.eventDate ?? "")))
+      .slice(0, 100);
+    emit();
+  }, onError));
+
   return () => unsubs.forEach((unsubscribe) => unsubscribe());
 }
 
@@ -324,9 +386,12 @@ export async function addCashEntry(profile: UserProfile, entry: NewCashEntry) {
     note: clean(entry.note, 240),
     category: clean(entry.category, 50),
     jobId: null,
+    customerAccountId: null,
+    customerPaymentGroupId: null,
     createdBy: profile.uid,
     createdAt: serverTimestamp(),
   });
+  writeAudit(profile, "create", "cash", `${entry.kind === "income" ? "Gelir" : "Gider"} eklendi: ${clean(entry.counterparty || entry.category, 80)} · ${(entry.amountCents / 100).toFixed(2)} TL`);
 }
 
 export async function addAdvance(profile: UserProfile, entry: NewAdvance) {
@@ -337,22 +402,57 @@ export async function addAdvance(profile: UserProfile, entry: NewAdvance) {
     createdBy: profile.uid,
     createdAt: serverTimestamp(),
   });
+  writeAudit(profile, "create", "advance", `Avans eklendi · ${(entry.amountCents / 100).toFixed(2)} TL`);
 }
 
 export async function addJob(profile: UserProfile, entry: NewJob) {
   const { db } = requireFirebase();
-  await addDoc(collection(db, "companies", profile.companyId, "jobs"), {
-    ...entry,
-    customerName: clean(entry.customerName, 80),
-    title: clean(entry.title, 100),
-    note: clean(entry.note, 240),
-    paidCents: 0,
-    status: "open",
-    paidDate: null,
-    createdBy: profile.uid,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
+  const customerName = clean(entry.customerName, 80);
+  const title = clean(entry.title, 100);
+  const accountId = customerAccountId(customerName);
+  const accountRef = doc(db, "companies", profile.companyId, "customerAccounts", accountId);
+  const jobRef = doc(collection(db, "companies", profile.companyId, "jobs"));
+
+  let appliedCredit = 0;
+  await runTransaction(db, async (transaction) => {
+    const accountSnapshot = await transaction.get(accountRef);
+    const availableCredit = accountSnapshot.exists()
+      ? Math.max(0, Number(accountSnapshot.data().creditCents ?? 0))
+      : 0;
+    appliedCredit = Math.min(availableCredit, entry.amountCents);
+    const fullyPaid = appliedCredit >= entry.amountCents;
+    const now = serverTimestamp();
+
+    transaction.set(jobRef, {
+      ...entry,
+      customerName,
+      title,
+      note: clean(entry.note, 240),
+      paidCents: appliedCredit,
+      creditAppliedCents: appliedCredit,
+      status: fullyPaid ? "paid" : appliedCredit > 0 ? "partial" : "open",
+      paidDate: fullyPaid ? entry.plannedDate : null,
+      createdBy: profile.uid,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    if (appliedCredit > 0) {
+      transaction.set(accountRef, {
+        customerName,
+        creditCents: Math.max(0, availableCredit - appliedCredit),
+        updatedBy: profile.uid,
+        updatedAt: now,
+      }, { merge: true });
+    }
   });
+
+  writeAudit(
+    profile,
+    "create",
+    "job",
+    `${customerName} için iş eklendi: ${title} · ${(entry.amountCents / 100).toFixed(2)} TL${appliedCredit > 0 ? ` · ${(appliedCredit / 100).toFixed(2)} TL müşteri avansından düşüldü` : ""}`,
+  );
 }
 
 export async function addJobPayment(
@@ -365,35 +465,24 @@ export async function addJobPayment(
   const { db } = requireFirebase();
   const jobRef = doc(db, "companies", profile.companyId, "jobs", jobId);
   const paymentRef = doc(collection(db, "companies", profile.companyId, "cashEntries"));
+  let auditSummary = "İş ödemesi kaydedildi.";
 
   await runTransaction(db, async (transaction) => {
     const snapshot = await transaction.get(jobRef);
     if (!snapshot.exists()) throw new Error("İş kaydı bulunamadı.");
 
-    const raw = snapshot.data() as Job & { originalAmountCents?: number; paidAmountCents?: number };
-    const storedAmount = Number(raw.amountCents ?? 0);
-    const jobAmount = Number.isInteger(raw.originalAmountCents) && Number(raw.originalAmountCents) > 0
-      ? Number(raw.originalAmountCents)
-      : storedAmount;
-    const legacyPaid = Number.isInteger(raw.paidAmountCents) && Number(raw.paidAmountCents) > 0
-      ? Number(raw.paidAmountCents)
-      : raw.status === "paid"
-        ? jobAmount
-        : 0;
-    const currentPaid = Math.max(
-      0,
-      Math.min(jobAmount, Number.isInteger(raw.paidCents) ? Number(raw.paidCents) : legacyPaid),
-    );
-    if (raw.status === "paid" || currentPaid >= jobAmount) throw new Error("Bu iş zaten tamamen ödenmiş.");
+    const raw = normalizeJob({ id: snapshot.id, ...snapshot.data() } as Omit<Job, "vehiclePartnerName">);
+    const currentPaid = raw.paidCents;
+    if (raw.status === "paid" || currentPaid >= raw.amountCents) throw new Error("Bu iş zaten tamamen ödenmiş.");
     if (!Number.isInteger(amountCents) || amountCents <= 0) throw new Error("Geçerli bir ödeme tutarı yazın.");
 
-    const remaining = jobAmount - currentPaid;
+    const remaining = raw.amountCents - currentPaid;
     if (amountCents > remaining) {
-      throw new Error(`Ödeme kalan tutarı geçemez. Kalan: ${(remaining / 100).toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₺`);
+      throw new Error(`Bu işte fazla ödeme yerine müşteri kartındaki “Toplam bakiyeden tahsilat al” alanını kullanın. Kalan: ${(remaining / 100).toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₺`);
     }
 
     const nextPaid = currentPaid + amountCents;
-    const fullyPaid = nextPaid >= jobAmount;
+    const fullyPaid = nextPaid >= raw.amountCents;
     const now = serverTimestamp();
 
     transaction.set(paymentRef, {
@@ -404,72 +493,255 @@ export async function addJobPayment(
       note: clean(note, 240) || `${clean(raw.title, 100)} işi ödemesi`,
       entryDate: paidDate,
       jobId,
+      customerAccountId: null,
+      customerPaymentGroupId: null,
       createdBy: profile.uid,
       createdAt: now,
     });
 
     transaction.update(jobRef, {
-      amountCents: jobAmount,
+      amountCents: raw.amountCents,
       paidCents: nextPaid,
+      creditAppliedCents: raw.creditAppliedCents,
       status: fullyPaid ? "paid" : "partial",
       paidDate: fullyPaid ? paidDate : null,
       updatedAt: now,
     });
+    auditSummary = `${raw.customerName} · ${raw.title} için ${(amountCents / 100).toFixed(2)} TL ödeme alındı.`;
   });
+
+  writeAudit(profile, "payment", "job", auditSummary);
+}
+
+export async function addCustomerPayment(
+  profile: UserProfile,
+  customerName: string,
+  amountCents: number,
+  paidDate: string,
+  note: string,
+) {
+  const { db } = requireFirebase();
+  const cleanCustomer = clean(customerName, 80);
+  if (!cleanCustomer) throw new Error("Müşteri adı bulunamadı.");
+  if (!Number.isInteger(amountCents) || amountCents <= 0) throw new Error("Geçerli bir tahsilat tutarı yazın.");
+
+  const jobsRef = collection(db, "companies", profile.companyId, "jobs");
+  const jobsSnapshot = await getDocs(jobsRef);
+  const customerKey = normalizedCustomer(cleanCustomer);
+  const accountId = customerAccountId(cleanCustomer);
+  const accountRef = doc(db, "companies", profile.companyId, "customerAccounts", accountId);
+
+  const candidates = jobsSnapshot.docs
+    .filter((item) => normalizedCustomer(String(item.data().customerName ?? "")) === customerKey)
+    .sort((a, b) => {
+      const byDate = String(a.data().plannedDate ?? "").localeCompare(String(b.data().plannedDate ?? ""));
+      return byDate || a.id.localeCompare(b.id);
+    });
+
+  if (candidates.length > 200) throw new Error("Bu müşteride çok fazla iş var. Tahsilatı daha küçük gruplar halinde kaydedin.");
+
+  const groupId = `customer_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  let allocatedTotal = 0;
+  let excessCredit = 0;
+
+  await runTransaction(db, async (transaction) => {
+    const accountSnapshot = await transaction.get(accountRef);
+    const snapshots = [];
+    for (const candidate of candidates) snapshots.push(await transaction.get(candidate.ref));
+
+    const prepared = snapshots
+      .filter((snapshot) => snapshot.exists())
+      .map((snapshot) => {
+        const raw = normalizeJob({ id: snapshot.id, ...snapshot.data() } as Omit<Job, "vehiclePartnerName">);
+        return {
+          ref: snapshot.ref,
+          raw,
+          remaining: Math.max(0, raw.amountCents - raw.paidCents),
+        };
+      })
+      .filter((item) => item.remaining > 0)
+      .sort((a, b) => {
+        const byDate = String(a.raw.plannedDate ?? "").localeCompare(String(b.raw.plannedDate ?? ""));
+        return byDate || a.ref.id.localeCompare(b.ref.id);
+      });
+
+    const totalRemaining = prepared.reduce((sum, item) => sum + item.remaining, 0);
+    let undistributed = Math.min(amountCents, totalRemaining);
+    allocatedTotal = undistributed;
+    excessCredit = amountCents - undistributed;
+    const now = serverTimestamp();
+
+    for (const item of prepared) {
+      if (undistributed <= 0) break;
+      const allocated = Math.min(undistributed, item.remaining);
+      const nextPaid = item.raw.paidCents + allocated;
+      const fullyPaid = nextPaid >= item.raw.amountCents;
+      const paymentRef = doc(collection(db, "companies", profile.companyId, "cashEntries"));
+      const baseNote = clean(note, 160);
+      const title = clean(String(item.raw.title ?? "İş"), 100);
+
+      transaction.set(paymentRef, {
+        kind: "income",
+        amountCents: allocated,
+        category: "Toplu tahsilat",
+        counterparty: cleanCustomer,
+        note: baseNote ? `Toplu tahsilat · ${title} · ${baseNote}` : `Toplu tahsilat · ${title}`,
+        entryDate: paidDate,
+        jobId: item.ref.id,
+        customerAccountId: accountId,
+        customerPaymentGroupId: groupId,
+        createdBy: profile.uid,
+        createdAt: now,
+      });
+
+      transaction.update(item.ref, {
+        amountCents: item.raw.amountCents,
+        paidCents: nextPaid,
+        creditAppliedCents: item.raw.creditAppliedCents,
+        status: fullyPaid ? "paid" : "partial",
+        paidDate: fullyPaid ? paidDate : null,
+        updatedAt: now,
+      });
+
+      undistributed -= allocated;
+    }
+
+    if (excessCredit > 0) {
+      const existingCredit = accountSnapshot.exists() ? Math.max(0, Number(accountSnapshot.data().creditCents ?? 0)) : 0;
+      const creditEntryRef = doc(collection(db, "companies", profile.companyId, "cashEntries"));
+      transaction.set(creditEntryRef, {
+        kind: "income",
+        amountCents: excessCredit,
+        category: "Müşteri avansı",
+        counterparty: cleanCustomer,
+        note: clean(note, 180) || "Açık borcu aşan müşteri tahsilatı",
+        entryDate: paidDate,
+        jobId: null,
+        customerAccountId: accountId,
+        customerPaymentGroupId: groupId,
+        createdBy: profile.uid,
+        createdAt: now,
+      });
+      transaction.set(accountRef, {
+        customerName: cleanCustomer,
+        creditCents: existingCredit + excessCredit,
+        updatedBy: profile.uid,
+        updatedAt: now,
+      }, { merge: true });
+    }
+  });
+
+  const details = [
+    allocatedTotal > 0 ? `${(allocatedTotal / 100).toFixed(2)} TL açık işlere dağıtıldı` : "",
+    excessCredit > 0 ? `${(excessCredit / 100).toFixed(2)} TL müşteri avansı olarak kaldı` : "",
+  ].filter(Boolean).join(" · ");
+  writeAudit(profile, "payment", "customer", `${cleanCustomer} için ${(amountCents / 100).toFixed(2)} TL toplam tahsilat alındı${details ? ` · ${details}` : ""}.`);
 }
 
 export async function deleteCashEntry(profile: UserProfile, entryId: string) {
   const { db } = requireFirebase();
   const entryRef = doc(db, "companies", profile.companyId, "cashEntries", entryId);
+  let auditSummary = "Kasa kaydı silindi.";
 
   await runTransaction(db, async (transaction) => {
     const entrySnapshot = await transaction.get(entryRef);
     if (!entrySnapshot.exists()) return;
-    const entry = entrySnapshot.data() as CashEntry;
+    const entry = { id: entrySnapshot.id, ...entrySnapshot.data() } as CashEntry;
 
-    if (entry.jobId && entry.kind === "income") {
-      const jobRef = doc(db, "companies", profile.companyId, "jobs", entry.jobId);
-      const jobSnapshot = await transaction.get(jobRef);
-      if (jobSnapshot.exists()) {
-        const raw = jobSnapshot.data() as Job & { originalAmountCents?: number; paidAmountCents?: number };
-        const storedAmount = Number(raw.amountCents ?? 0);
-        const amountCents = Number.isInteger(raw.originalAmountCents) && Number(raw.originalAmountCents) > 0
-          ? Number(raw.originalAmountCents)
-          : storedAmount;
-        const legacyPaid = Number.isInteger(raw.paidAmountCents) && Number(raw.paidAmountCents) > 0
-          ? Number(raw.paidAmountCents)
-          : raw.status === "paid"
-            ? amountCents
-            : 0;
-        const currentPaid = Math.max(
-          0,
-          Math.min(amountCents, Number.isInteger(raw.paidCents) ? Number(raw.paidCents) : legacyPaid),
-        );
-        const nextPaid = Math.max(0, currentPaid - Number(entry.amountCents ?? 0));
-        transaction.update(jobRef, {
-          amountCents,
-          paidCents: nextPaid,
-          status: nextPaid <= 0 ? "open" : nextPaid >= amountCents ? "paid" : "partial",
-          paidDate: nextPaid >= amountCents ? raw.paidDate ?? entry.entryDate : null,
-          updatedAt: serverTimestamp(),
-        });
+    const jobRef = entry.jobId && entry.kind === "income"
+      ? doc(db, "companies", profile.companyId, "jobs", entry.jobId)
+      : null;
+    const accountRef = entry.category === "Müşteri avansı" && entry.customerAccountId
+      ? doc(db, "companies", profile.companyId, "customerAccounts", entry.customerAccountId)
+      : null;
+
+    const jobSnapshot = jobRef ? await transaction.get(jobRef) : null;
+    const accountSnapshot = accountRef ? await transaction.get(accountRef) : null;
+
+    if (jobRef && jobSnapshot?.exists()) {
+      const raw = normalizeJob({ id: jobSnapshot.id, ...jobSnapshot.data() } as Omit<Job, "vehiclePartnerName">);
+      const nextPaid = Math.max(raw.creditAppliedCents, raw.paidCents - Number(entry.amountCents ?? 0));
+      transaction.update(jobRef, {
+        amountCents: raw.amountCents,
+        paidCents: nextPaid,
+        creditAppliedCents: raw.creditAppliedCents,
+        status: nextPaid <= 0 ? "open" : nextPaid >= raw.amountCents ? "paid" : "partial",
+        paidDate: nextPaid >= raw.amountCents ? raw.paidDate ?? entry.entryDate : null,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    if (accountRef) {
+      const currentCredit = accountSnapshot?.exists() ? Math.max(0, Number(accountSnapshot.data().creditCents ?? 0)) : 0;
+      if (currentCredit < entry.amountCents) {
+        throw new Error("Bu müşteri avansının bir kısmı sonraki işlerde kullanılmış. Önce avansın kullanıldığı iş kaydını düzeltin veya silin.");
       }
+      transaction.set(accountRef, {
+        customerName: clean(entry.counterparty, 80),
+        creditCents: currentCredit - entry.amountCents,
+        updatedBy: profile.uid,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
     }
 
     transaction.delete(entryRef);
+    auditSummary = `${entry.kind === "income" ? "Gelir" : "Gider"} silindi: ${entry.counterparty || entry.category} · ${(entry.amountCents / 100).toFixed(2)} TL`;
   });
+
+  writeAudit(profile, "delete", "cash", auditSummary);
 }
 
 export async function deleteJob(profile: UserProfile, jobId: string) {
   const { db } = requireFirebase();
+  const jobRef = doc(db, "companies", profile.companyId, "jobs", jobId);
+  const jobSnapshot = await getDoc(jobRef);
+  const job = jobSnapshot.exists()
+    ? normalizeJob({ id: jobSnapshot.id, ...jobSnapshot.data() } as Omit<Job, "vehiclePartnerName">)
+    : null;
+
   const cashRef = collection(db, "companies", profile.companyId, "cashEntries");
   const linked = await getDocs(query(cashRef, where("jobId", "==", jobId)));
-  if (linked.size > 450) throw new Error("Bu işe bağlı çok fazla ödeme var. Destek için kayıtları bölerek silin.");
+  if (linked.size > 450) throw new Error("Bu işe bağlı çok fazla ödeme var. Kayıtları bölerek silin.");
 
   const batch = writeBatch(db);
   linked.docs.forEach((item) => batch.delete(item.ref));
-  batch.delete(doc(db, "companies", profile.companyId, "jobs", jobId));
+  batch.delete(jobRef);
+
+  if (job && job.creditAppliedCents > 0) {
+    const accountRef = doc(db, "companies", profile.companyId, "customerAccounts", customerAccountId(job.customerName));
+    batch.set(accountRef, {
+      customerName: clean(job.customerName, 80),
+      creditCents: increment(job.creditAppliedCents),
+      updatedBy: profile.uid,
+      updatedAt: serverTimestamp(),
+    }, { merge: true });
+  }
+
   await batch.commit();
+  writeAudit(profile, "delete", "job", job ? `${job.customerName} · ${job.title} işi silindi.` : `İş kaydı silindi (${jobId}).`);
+}
+
+export async function saveCompanySettings(profile: UserProfile, values: CompanySettingsInput) {
+  const { db } = requireFirebase();
+  const name = clean(values.name, 80);
+  if (!name) throw new Error("Firma adı zorunludur.");
+  const logoDataUrl = values.logoDataUrl.trim();
+  if (logoDataUrl && !logoDataUrl.startsWith("data:image/")) throw new Error("Logo dosyası geçerli bir görsel olmalı.");
+  if (logoDataUrl.length > 300_000) throw new Error("Logo çok büyük. Daha küçük bir görsel seçin.");
+
+  await setDoc(doc(db, "companies", profile.companyId), {
+    name,
+    phone: clean(values.phone, 40),
+    email: clean(values.email, 120),
+    address: clean(values.address, 240),
+    taxOffice: clean(values.taxOffice, 80),
+    taxNumber: clean(values.taxNumber, 40),
+    logoDataUrl,
+    updatedBy: profile.uid,
+    updatedAt: serverTimestamp(),
+  }, { merge: true });
+
+  writeAudit(profile, "settings", "company", "Firma bilgileri ve PDF kurumsal ayarları güncellendi.");
 }
 
 export async function saveProfileName(profile: UserProfile, displayName: string) {

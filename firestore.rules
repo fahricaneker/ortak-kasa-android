@@ -73,7 +73,23 @@ service cloud.firestore {
         && request.resource.data.name is string
         && request.resource.data.inviteCode is string
         && isMemberAfter(companyId);
-      allow update, delete: if false;
+      allow update: if isMember(companyId)
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.inviteCode == resource.data.inviteCode
+        && request.resource.data.name is string
+        && request.resource.data.phone is string
+        && request.resource.data.email is string
+        && request.resource.data.address is string
+        && request.resource.data.taxOffice is string
+        && request.resource.data.taxNumber is string
+        && request.resource.data.logoDataUrl is string
+        && request.resource.data.logoDataUrl.size() <= 300000
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'phone', 'email', 'address', 'taxOffice', 'taxNumber', 'logoDataUrl', 'updatedBy', 'updatedAt'
+        ]);
+      allow delete: if false;
 
       match /partners/{partnerId} {
         allow read: if isMember(companyId);
@@ -114,13 +130,40 @@ service cloud.firestore {
         allow read: if isMember(companyId);
         allow create: if isMember(companyId)
           && request.resource.data.createdBy == request.auth.uid
-          && request.resource.data.status == 'open'
+          && request.resource.data.status in ['open', 'partial', 'paid']
           && request.resource.data.amountCents is int
           && request.resource.data.amountCents > 0
+          && request.resource.data.paidCents is int
+          && request.resource.data.paidCents >= 0
+          && request.resource.data.paidCents <= request.resource.data.amountCents
+          && request.resource.data.creditAppliedCents is int
+          && request.resource.data.creditAppliedCents >= 0
+          && request.resource.data.creditAppliedCents <= request.resource.data.paidCents
           && request.resource.data.serviceFeeCents is int
           && request.resource.data.serviceFeeCents >= 0
           && request.resource.data.plannedDate is string;
         allow update, delete: if isMember(companyId);
+      }
+
+      match /customerAccounts/{accountId} {
+        allow read: if isMember(companyId);
+        allow create, update: if isMember(companyId)
+          && request.resource.data.customerName is string
+          && request.resource.data.creditCents is int
+          && request.resource.data.creditCents >= 0
+          && request.resource.data.updatedBy == request.auth.uid;
+        allow delete: if false;
+      }
+
+      match /auditLogs/{logId} {
+        allow read: if isMember(companyId);
+        allow create: if isMember(companyId)
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.actorUid == request.auth.uid
+          && request.resource.data.actorName is string
+          && request.resource.data.summary is string
+          && request.resource.data.eventDate is string;
+        allow update, delete: if false;
       }
     }
 

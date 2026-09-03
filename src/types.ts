@@ -14,6 +14,12 @@ export type Company = {
   name: string;
   inviteCode: string;
   ownerUid: string;
+  phone?: string;
+  email?: string;
+  address?: string;
+  taxOffice?: string;
+  taxNumber?: string;
+  logoDataUrl?: string;
 };
 
 export type Partner = {
@@ -33,6 +39,8 @@ export type CashEntry = {
   note: string;
   entryDate: string;
   jobId: string | null;
+  customerAccountId?: string | null;
+  customerPaymentGroupId?: string | null;
 };
 
 export type Advance = {
@@ -50,6 +58,7 @@ export type Job = {
   title: string;
   amountCents: number;
   paidCents: number;
+  creditAppliedCents: number;
   plannedDate: string;
   vehiclePartnerId: string | null;
   vehiclePartnerName: string | null;
@@ -59,14 +68,42 @@ export type Job = {
   paidDate: string | null;
 };
 
+export type CustomerAccount = {
+  id: string;
+  customerName: string;
+  creditCents: number;
+};
+
+export type AuditLog = {
+  id: string;
+  action: "create" | "update" | "delete" | "payment" | "settings";
+  entityType: "job" | "cash" | "advance" | "customer" | "company";
+  summary: string;
+  actorUid: string;
+  actorName: string;
+  eventDate: string;
+};
+
+export type CompanySettingsInput = {
+  name: string;
+  phone: string;
+  email: string;
+  address: string;
+  taxOffice: string;
+  taxNumber: string;
+  logoDataUrl: string;
+};
+
 export type CompanyData = {
   company: Company;
   partners: Partner[];
   cashEntries: CashEntry[];
   advances: Advance[];
   jobs: Job[];
+  customerAccounts: CustomerAccount[];
+  auditLogs: AuditLog[];
 };
 
-export type NewCashEntry = Omit<CashEntry, "id" | "jobId">;
+export type NewCashEntry = Omit<CashEntry, "id" | "jobId" | "customerAccountId" | "customerPaymentGroupId">;
 export type NewAdvance = Omit<Advance, "id" | "partnerName">;
-export type NewJob = Omit<Job, "id" | "vehiclePartnerName" | "status" | "paidDate" | "paidCents">;
+export type NewJob = Omit<Job, "id" | "vehiclePartnerName" | "status" | "paidDate" | "paidCents" | "creditAppliedCents">;

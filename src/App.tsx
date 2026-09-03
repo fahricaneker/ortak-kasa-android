@@ -10,6 +10,7 @@ import {
   addCashEntry,
   addJob,
   addJobPayment,
+  addCustomerPayment,
   createCompany,
   deleteCashEntry,
   deleteJob,
@@ -18,12 +19,13 @@ import {
   logout,
   register,
   resetPassword,
+  saveCompanySettings,
   subscribeCompany,
   subscribeProfile,
 } from "./lib/data";
 import { auth, firebaseConfigured } from "./lib/firebase";
 import { errorMessage } from "./lib/utils";
-import type { CompanyData, NewAdvance, NewCashEntry, NewJob, UserProfile } from "./types";
+import type { CompanyData, CompanySettingsInput, NewAdvance, NewCashEntry, NewJob, UserProfile } from "./types";
 
 type Notice = { id: number; message: string; tone: "success" | "error" | "info" };
 
@@ -160,8 +162,11 @@ export default function App() {
   const handleAddJob = (entry: NewJob) => withBusy(() => addJob(requireProfile(), entry));
   const handleAddPayment = (jobId: string, amountCents: number, paidDate: string, note: string) =>
     withBusy(() => addJobPayment(requireProfile(), jobId, amountCents, paidDate, note));
+  const handleCollectCustomer = (customerName: string, amountCents: number, paidDate: string, note: string) =>
+    withBusy(() => addCustomerPayment(requireProfile(), customerName, amountCents, paidDate, note));
   const handleDeleteJob = (jobId: string) => withBusy(() => deleteJob(requireProfile(), jobId));
   const handleDeleteCash = (entryId: string) => withBusy(() => deleteCashEntry(requireProfile(), entryId));
+  const handleSaveCompany = (values: CompanySettingsInput) => withBusy(() => saveCompanySettings(requireProfile(), values));
 
   let content;
   if (!firebaseConfigured) {
@@ -182,8 +187,10 @@ export default function App() {
         onAddAdvance={handleAddAdvance}
         onAddJob={handleAddJob}
         onAddPayment={handleAddPayment}
+        onCollectCustomer={handleCollectCustomer}
         onDeleteJob={handleDeleteJob}
         onDeleteCash={handleDeleteCash}
+        onSaveCompany={handleSaveCompany}
         onLogout={handleLogout}
         notify={notify}
       />

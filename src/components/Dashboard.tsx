@@ -1,4 +1,4 @@
-import { useMemo, useState, type ComponentType, type SVGProps } from "react";
+import { useEffect, useMemo, useState, type ComponentType, type SVGProps } from "react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { Capacitor } from "@capacitor/core";
@@ -8,6 +8,8 @@ import {
   ArrowDown,
   ArrowUp,
   BriefcaseBusiness,
+  Building2,
+  Calculator,
   CalendarDays,
   Car,
   Check,
@@ -17,23 +19,27 @@ import {
   Copy,
   FileDown,
   HandCoins,
+  History,
   House,
   LogOut,
+  MessageCircle,
   Plus,
   ReceiptText,
   Settings,
+  TimerReset,
   Trash2,
   UserRound,
   Users,
   WalletCards,
 } from "lucide-react";
 
-import type { CashEntry, CompanyData, Job, NewAdvance, NewCashEntry, NewJob, Period, UserProfile } from "../types";
+import type { CashEntry, CompanyData, CompanySettingsInput, Job, NewAdvance, NewCashEntry, NewJob, Period, UserProfile } from "../types";
 import {
   effectiveJobDate,
   isInRange,
   localDateKey,
   money,
+  parseMoney,
   periodLabels,
   periodRange,
   shiftAnchor,
@@ -46,7 +52,7 @@ import {
   TransactionDialog,
   type EntryDialog,
 } from "./EntryDialogs";
-import { Modal } from "./Modal";
+import { Field, Modal } from "./Modal";
 
 type Tab = "overview" | "jobs" | "cash" | "advances" | "vehicles";
 type Icon = ComponentType<SVGProps<SVGSVGElement> & { size?: number | string }>;
@@ -62,6 +68,49 @@ function jobPaid(job: Job) {
 
 function jobRemaining(job: Job) {
   return Math.max(0, job.amountCents - jobPaid(job));
+}
+
+function overdueDays(job: Job, today: string) {
+  if (job.status === "paid" || job.plannedDate >= today) return 0;
+  const [sy, sm, sd] = job.plannedDate.split("-").map(Number);
+  const [ey, em, ed] = today.split("-").map(Number);
+  return Math.max(0, Math.floor((Date.UTC(ey, em - 1, ed) - Date.UTC(sy, sm - 1, sd)) / 86_400_000));
+}
+
+function customerCredit(data: CompanyData, customerName: string) {
+  const key = normalizedCustomer(customerName);
+  return data.customerAccounts.find((item) => normalizedCustomer(item.customerName) === key)?.creditCents ?? 0;
+}
+
+async function compressLogo(file: File) {
+  if (!file.type.startsWith("image/")) throw new Error("Logo için bir görsel dosyası seçin.");
+  const url = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("Logo görseli açılamadı."));
+      image.src = url;
+    });
+    const max = 480;
+    const ratio = Math.min(1, max / Math.max(image.naturalWidth, image.naturalHeight));
+    const width = Math.max(1, Math.round(image.naturalWidth * ratio));
+    const height = Math.max(1, Math.round(image.naturalHeight * ratio));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Logo işlenemedi.");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(image, 0, 0, width, height);
+    let dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+    if (dataUrl.length > 280_000) dataUrl = canvas.toDataURL("image/jpeg", 0.64);
+    if (dataUrl.length > 300_000) throw new Error("Logo hâlâ çok büyük. Daha küçük bir görsel seçin.");
+    return dataUrl;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 function escapeHtml(value: string) {
@@ -81,8 +130,10 @@ export function Dashboard({
   onAddAdvance,
   onAddJob,
   onAddPayment,
+  onCollectCustomer,
   onDeleteJob,
   onDeleteCash,
+  onSaveCompany,
   onLogout,
   notify,
 }: {
@@ -93,8 +144,10 @@ export function Dashboard({
   onAddAdvance: (entry: NewAdvance) => Promise<void>;
   onAddJob: (entry: NewJob) => Promise<void>;
   onAddPayment: (jobId: string, amountCents: number, paidDate: string, note: string) => Promise<void>;
+  onCollectCustomer: (customerName: string, amountCents: number, paidDate: string, note: string) => Promise<void>;
   onDeleteJob: (jobId: string) => Promise<void>;
   onDeleteCash: (entryId: string) => Promise<void>;
+  onSaveCompany: (values: CompanySettingsInput) => Promise<void>;
   onLogout: () => Promise<void>;
   notify: (message: string, tone?: "success" | "error" | "info") => void;
 }) {
@@ -131,9 +184,27 @@ export function Dashboard({
     const expense = cashEntries.filter((item) => item.kind === "expense").reduce((sum, item) => sum + item.amountCents, 0);
     const advanceTotal = advances.reduce((sum, item) => sum + item.amountCents, 0);
     const receivables = openJobs.reduce((sum, item) => sum + jobRemaining(item), 0);
+    const overdueJobs = openJobs.filter((item) => overdueDays(item, today) > 0);
+    const overdueReceivables = overdueJobs.reduce((sum, item) => sum + jobRemaining(item), 0);
     const vehicleFees = jobs.reduce((sum, item) => sum + item.serviceFeeCents, 0);
-    return { cashEntries, advances, jobs, openJobs, income, expense, advanceTotal, receivables, vehicleFees, balance: income - expense - advanceTotal };
+    return { cashEntries, advances, jobs, openJobs, overdueJobs, income, expense, advanceTotal, receivables, overdueReceivables, vehicleFees, balance: income - expense - advanceTotal };
   }, [data, range.start, range.end, today]);
+
+  const settlement = useMemo(() => {
+    const periodJobs = data.jobs.filter((job) => isInRange(job.plannedDate, range.start, range.end));
+    const vehicleTotal = periodJobs.reduce((sum, job) => sum + job.serviceFeeCents, 0);
+    const partnershipPool = computed.income - computed.expense - vehicleTotal;
+    const partnerCount = Math.max(1, data.partners.length);
+    const baseShare = Math.trunc(partnershipPool / partnerCount);
+    const remainder = partnershipPool - baseShare * partnerCount;
+    const rows = data.partners.map((partner, index) => {
+      const vehicleFee = periodJobs.filter((job) => job.vehiclePartnerId === partner.id).reduce((sum, job) => sum + job.serviceFeeCents, 0);
+      const advance = computed.advances.filter((item) => item.partnerId === partner.id).reduce((sum, item) => sum + item.amountCents, 0);
+      const share = baseShare + (index === 0 ? remainder : 0);
+      return { partner, vehicleFee, advance, share, settlement: share + vehicleFee - advance };
+    });
+    return { vehicleTotal, partnershipPool, rows };
+  }, [data.jobs, data.partners, computed.income, computed.expense, computed.advances, range.start, range.end]);
 
   const customRangeActive = Boolean(jobFrom && jobTo);
   const jobsForView = useMemo(() => {
@@ -191,6 +262,90 @@ export function Dashboard({
     void perform(() => onDeleteCash(entry.id), "Kasa kaydı silindi.");
   };
 
+  const renderPdfAndShare = async ({
+    html,
+    filename,
+    title,
+    text,
+    orientation = "portrait",
+    width = 900,
+  }: {
+    html: string;
+    filename: string;
+    title: string;
+    text: string;
+    orientation?: "portrait" | "landscape";
+    width?: number;
+  }) => {
+    const host = document.createElement("div");
+    host.style.position = "fixed";
+    host.style.left = "-12000px";
+    host.style.top = "0";
+    host.style.width = `${width}px`;
+    host.style.background = "#ffffff";
+    host.innerHTML = html;
+    Array.from(host.querySelectorAll("td")).forEach((cell) => {
+      const el = cell as HTMLElement;
+      el.style.padding = "10px 9px";
+      el.style.borderBottom = "1px solid #e2e8f0";
+      if (el.classList.contains("num")) el.style.textAlign = "right";
+    });
+
+    document.body.appendChild(host);
+    try {
+      const canvas = await html2canvas(host.firstElementChild as HTMLElement, {
+        scale: 2,
+        backgroundColor: "#ffffff",
+        useCORS: true,
+        logging: false,
+      });
+      const pdf = new jsPDF({ orientation, unit: "mm", format: "a4" });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 8;
+      const imageWidth = pageWidth - margin * 2;
+      const imageHeight = (canvas.height * imageWidth) / canvas.width;
+      const image = canvas.toDataURL("image/png", 1);
+      const usableHeight = pageHeight - margin * 2;
+      let offset = 0;
+      let firstPage = true;
+
+      while (offset < imageHeight) {
+        if (!firstPage) pdf.addPage();
+        pdf.addImage(image, "PNG", margin, margin - offset, imageWidth, imageHeight, undefined, "FAST");
+        offset += usableHeight;
+        firstPage = false;
+      }
+
+      if (Capacitor.isNativePlatform()) {
+        const dataUri = pdf.output("datauristring");
+        const base64 = dataUri.includes(",") ? dataUri.split(",")[1] : dataUri;
+        await Filesystem.writeFile({ path: filename, data: base64, directory: Directory.Cache });
+        const result = await Filesystem.getUri({ path: filename, directory: Directory.Cache });
+        await Share.share({
+          title,
+          text,
+          files: [result.uri],
+          dialogTitle: "WhatsApp, e-posta veya başka bir uygulama ile paylaş",
+        });
+      } else {
+        pdf.save(filename);
+      }
+    } finally {
+      host.remove();
+    }
+  };
+
+  const companyLogo = data.company.logoDataUrl || new URL("icon-512.png", window.location.href).href;
+  const companyInfoLines = [
+    data.company.phone ? `Tel: ${escapeHtml(data.company.phone)}` : "",
+    data.company.email ? `E-posta: ${escapeHtml(data.company.email)}` : "",
+    data.company.address ? escapeHtml(data.company.address) : "",
+    data.company.taxOffice || data.company.taxNumber
+      ? `${escapeHtml(data.company.taxOffice || "")} ${data.company.taxNumber ? `· VKN/TCKN: ${escapeHtml(data.company.taxNumber)}` : ""}`
+      : "",
+  ].filter(Boolean);
+
   const exportPdf = async () => {
     if (!jobsForView.length) {
       notify("PDF oluşturmak için seçili aralıkta en az bir iş olmalı.", "info");
@@ -202,6 +357,7 @@ export function Dashboard({
     const rows = jobsForView.map((job) => {
       const paid = jobPaid(job);
       const remaining = jobRemaining(job);
+      const overdue = overdueDays(job, today);
       return `
         <tr>
           <td>${escapeHtml(shortDate(job.plannedDate))}</td>
@@ -210,24 +366,19 @@ export function Dashboard({
           <td class="num">${escapeHtml(money(job.amountCents))}</td>
           <td class="num">${escapeHtml(money(paid))}</td>
           <td class="num">${escapeHtml(money(remaining))}</td>
-          <td>${job.status === "paid" ? "Tamamlandı" : job.status === "partial" ? "Kısmi ödendi" : "Bekliyor"}</td>
+          <td>${job.status === "paid" ? "Tamamlandı" : overdue > 0 ? `${overdue} gün gecikmiş` : job.status === "partial" ? "Kısmi ödendi" : "Bekliyor"}</td>
         </tr>`;
     }).join("");
 
-    const host = document.createElement("div");
-    host.style.position = "fixed";
-    host.style.left = "-12000px";
-    host.style.top = "0";
-    host.style.width = "1120px";
-    host.style.background = "#ffffff";
-    host.innerHTML = `
+    const html = `
       <section style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;background:#fff;padding:44px 48px;width:1120px;box-sizing:border-box;">
-        <header style="display:flex;align-items:center;justify-content:space-between;border-bottom:3px solid #0f766e;padding-bottom:22px;margin-bottom:24px;">
-          <div style="display:flex;align-items:center;gap:18px;">
-            <img src="${new URL("icon-512.png", window.location.href).href}" alt="logo" style="width:70px;height:70px;border-radius:18px;object-fit:cover;" />
+        <header style="display:flex;align-items:flex-start;justify-content:space-between;border-bottom:3px solid #0f766e;padding-bottom:22px;margin-bottom:24px;gap:24px;">
+          <div style="display:flex;align-items:flex-start;gap:18px;max-width:690px;">
+            <img src="${companyLogo}" alt="logo" style="width:76px;height:76px;border-radius:18px;object-fit:contain;border:1px solid #e2e8f0;background:#fff;" />
             <div>
               <div style="font-size:30px;font-weight:800;letter-spacing:-0.5px;">${escapeHtml(data.company.name)}</div>
               <div style="font-size:15px;color:#64748b;margin-top:5px;">Ortak Kasa · İş ve Tahsilat Raporu</div>
+              ${companyInfoLines.length ? `<div style="font-size:11px;color:#64748b;line-height:1.5;margin-top:8px;">${companyInfoLines.join("<br>")}</div>` : ""}
             </div>
           </div>
           <div style="text-align:right;">
@@ -245,86 +396,83 @@ export function Dashboard({
         </div>
 
         <table style="width:100%;border-collapse:collapse;font-size:13px;">
-          <thead>
-            <tr style="background:#0f172a;color:#fff;">
-              <th style="text-align:left;padding:11px 9px;">Tarih</th>
-              <th style="text-align:left;padding:11px 9px;">Müşteri</th>
-              <th style="text-align:left;padding:11px 9px;">İş</th>
-              <th style="text-align:right;padding:11px 9px;">Toplam</th>
-              <th style="text-align:right;padding:11px 9px;">Alınan</th>
-              <th style="text-align:right;padding:11px 9px;">Kalan</th>
-              <th style="text-align:left;padding:11px 9px;">Durum</th>
-            </tr>
-          </thead>
+          <thead><tr style="background:#0f172a;color:#fff;">
+            <th style="text-align:left;padding:11px 9px;">Tarih</th><th style="text-align:left;padding:11px 9px;">Müşteri</th><th style="text-align:left;padding:11px 9px;">İş</th>
+            <th style="text-align:right;padding:11px 9px;">Toplam</th><th style="text-align:right;padding:11px 9px;">Alınan</th><th style="text-align:right;padding:11px 9px;">Kalan</th><th style="text-align:left;padding:11px 9px;">Durum</th>
+          </tr></thead>
           <tbody>${rows}</tbody>
         </table>
-
         <footer style="margin-top:26px;border-top:1px solid #e2e8f0;padding-top:14px;display:flex;justify-content:space-between;font-size:11px;color:#94a3b8;">
-          <span>${escapeHtml(data.company.name)} · Ortak Kasa</span>
-          <span>Bu rapor uygulamadaki kayıtlar esas alınarak oluşturulmuştur.</span>
+          <span>${escapeHtml(data.company.name)} · Ortak Kasa</span><span>Bu rapor uygulamadaki kayıtlar esas alınarak oluşturulmuştur.</span>
         </footer>
-      </section>
-    `;
+      </section>`;
 
-    Array.from(host.querySelectorAll("td")).forEach((cell) => {
-      const el = cell as HTMLElement;
-      el.style.padding = "10px 9px";
-      el.style.borderBottom = "1px solid #e2e8f0";
-      if (el.classList.contains("num")) el.style.textAlign = "right";
-    });
-
-    document.body.appendChild(host);
     try {
-      const canvas = await html2canvas(host.firstElementChild as HTMLElement, {
-        scale: 2,
-        backgroundColor: "#ffffff",
-        useCORS: true,
-        logging: false,
+      await renderPdfAndShare({
+        html,
+        width: 1120,
+        orientation: "landscape",
+        filename: `Ortak-Kasa_Is-Raporu_${reportStart}_${reportEnd}.pdf`,
+        title: `${data.company.name} iş raporu`,
+        text: `${shortDate(reportStart)} - ${shortDate(reportEnd)} iş ve tahsilat raporu`,
       });
-      const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 8;
-      const imageWidth = pageWidth - margin * 2;
-      const imageHeight = (canvas.height * imageWidth) / canvas.width;
-      const image = canvas.toDataURL("image/png", 1);
-      const usableHeight = pageHeight - margin * 2;
-
-      let offset = 0;
-      let firstPage = true;
-      while (offset < imageHeight) {
-        if (!firstPage) pdf.addPage();
-        pdf.addImage(image, "PNG", margin, margin - offset, imageWidth, imageHeight, undefined, "FAST");
-        offset += usableHeight;
-        firstPage = false;
-      }
-
-      const filename = `Ortak-Kasa_Is-Raporu_${reportStart}_${reportEnd}.pdf`;
-
-      if (Capacitor.isNativePlatform()) {
-        const dataUri = pdf.output("datauristring");
-        const base64 = dataUri.includes(",") ? dataUri.split(",")[1] : dataUri;
-        await Filesystem.writeFile({
-          path: filename,
-          data: base64,
-          directory: Directory.Cache,
-        });
-        const result = await Filesystem.getUri({ path: filename, directory: Directory.Cache });
-        await Share.share({
-          title: `${data.company.name} iş raporu`,
-          text: `${shortDate(reportStart)} - ${shortDate(reportEnd)} iş ve tahsilat raporu`,
-          files: [result.uri],
-          dialogTitle: "PDF raporunu paylaş veya kaydet",
-        });
-      } else {
-        pdf.save(filename);
-      }
-
       notify("Kurumsal PDF raporu oluşturuldu.", "success");
     } catch (error) {
       notify(error instanceof Error ? `PDF oluşturulamadı: ${error.message}` : "PDF oluşturulamadı.", "error");
-    } finally {
-      host.remove();
+    }
+  };
+
+  const exportCustomerStatement = async (customerName: string) => {
+    const key = normalizedCustomer(customerName);
+    const customerJobs = data.jobs
+      .filter((job) => normalizedCustomer(job.customerName) === key)
+      .sort((a, b) => a.plannedDate.localeCompare(b.plannedDate));
+    const jobIds = new Set(customerJobs.map((job) => job.id));
+    const payments = data.cashEntries
+      .filter((entry) => entry.kind === "income" && normalizedCustomer(entry.counterparty) === key && (entry.jobId ? jobIds.has(entry.jobId) : entry.category === "Müşteri avansı"))
+      .sort((a, b) => a.entryDate.localeCompare(b.entryDate));
+    const billed = customerJobs.reduce((sum, job) => sum + job.amountCents, 0);
+    const allocated = customerJobs.reduce((sum, job) => sum + jobPaid(job), 0);
+    const remaining = Math.max(0, billed - allocated);
+    const credit = customerCredit(data, customerName);
+    const jobRows = customerJobs.map((job) => `
+      <tr><td>${escapeHtml(shortDate(job.plannedDate))}</td><td>${escapeHtml(job.title)}</td><td class="num">${escapeHtml(money(job.amountCents))}</td><td class="num">${escapeHtml(money(jobPaid(job)))}</td><td class="num">${escapeHtml(money(jobRemaining(job)))}</td></tr>`).join("");
+    const paymentRows = payments.map((entry) => `
+      <tr><td>${escapeHtml(shortDate(entry.entryDate))}</td><td>${escapeHtml(entry.category)}</td><td>${escapeHtml(entry.note || "Tahsilat")}</td><td class="num">${escapeHtml(money(entry.amountCents))}</td></tr>`).join("");
+
+    const html = `
+      <section style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;background:#fff;padding:40px 42px;width:900px;box-sizing:border-box;">
+        <header style="display:flex;justify-content:space-between;gap:20px;border-bottom:3px solid #0f766e;padding-bottom:20px;margin-bottom:22px;">
+          <div style="display:flex;gap:16px;align-items:flex-start;">
+            <img src="${companyLogo}" style="width:72px;height:72px;border-radius:16px;object-fit:contain;border:1px solid #e2e8f0;" />
+            <div><div style="font-size:27px;font-weight:800;">${escapeHtml(data.company.name)}</div><div style="color:#64748b;margin-top:4px;">Müşteri Hesap Ekstresi</div>${companyInfoLines.length ? `<div style="font-size:11px;color:#64748b;line-height:1.5;margin-top:7px;">${companyInfoLines.join("<br>")}</div>` : ""}</div>
+          </div>
+          <div style="text-align:right;"><strong style="font-size:18px;">${escapeHtml(customerName)}</strong><div style="font-size:11px;color:#94a3b8;margin-top:5px;">${escapeHtml(new Date().toLocaleString("tr-TR"))}</div></div>
+        </header>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:22px;">
+          <div style="padding:14px;border:1px solid #e2e8f0;border-radius:12px;"><span style="display:block;font-size:12px;color:#64748b;">Toplam iş</span><strong>${escapeHtml(money(billed))}</strong></div>
+          <div style="padding:14px;border:1px solid #a7f3d0;background:#ecfdf5;border-radius:12px;"><span style="display:block;font-size:12px;color:#047857;">İşlere işlenen</span><strong>${escapeHtml(money(allocated))}</strong></div>
+          <div style="padding:14px;border:1px solid #fed7aa;background:#fff7ed;border-radius:12px;"><span style="display:block;font-size:12px;color:#c2410c;">Kalan borç</span><strong>${escapeHtml(money(remaining))}</strong></div>
+          <div style="padding:14px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:12px;"><span style="display:block;font-size:12px;color:#1d4ed8;">Müşteri avansı</span><strong>${escapeHtml(money(credit))}</strong></div>
+        </div>
+        <h3 style="margin:0 0 10px;">Yapılan işler</h3>
+        <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:24px;"><thead><tr style="background:#0f172a;color:#fff;"><th style="text-align:left;padding:9px;">Tarih</th><th style="text-align:left;padding:9px;">İş</th><th style="text-align:right;padding:9px;">Tutar</th><th style="text-align:right;padding:9px;">Alınan</th><th style="text-align:right;padding:9px;">Kalan</th></tr></thead><tbody>${jobRows || '<tr><td colspan="5">Kayıt yok</td></tr>'}</tbody></table>
+        <h3 style="margin:0 0 10px;">Tahsilat geçmişi</h3>
+        <table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr style="background:#0f766e;color:#fff;"><th style="text-align:left;padding:9px;">Tarih</th><th style="text-align:left;padding:9px;">Tür</th><th style="text-align:left;padding:9px;">Açıklama</th><th style="text-align:right;padding:9px;">Tutar</th></tr></thead><tbody>${paymentRows || '<tr><td colspan="4">Tahsilat kaydı yok</td></tr>'}</tbody></table>
+        <footer style="margin-top:24px;border-top:1px solid #e2e8f0;padding-top:12px;font-size:11px;color:#94a3b8;">${escapeHtml(data.company.name)} · Bu ekstre Ortak Kasa kayıtlarından otomatik oluşturulmuştur.</footer>
+      </section>`;
+
+    const safe = customerName.replace(/[^a-zA-Z0-9ğüşöçıİĞÜŞÖÇ]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 45) || "Musteri";
+    try {
+      await renderPdfAndShare({
+        html,
+        filename: `Hesap-Ekstresi_${safe}_${localDateKey()}.pdf`,
+        title: `${data.company.name} · ${customerName} hesap ekstresi`,
+        text: `${customerName} için kalan borç ${money(remaining)}, müşteri avansı ${money(credit)}.`,
+      });
+      notify("Müşteri hesap ekstresi paylaşmaya hazır.", "success");
+    } catch (error) {
+      notify(error instanceof Error ? `Ekstre oluşturulamadı: ${error.message}` : "Ekstre oluşturulamadı.", "error");
     }
   };
 
@@ -333,7 +481,9 @@ export function Dashboard({
       <header className="app-header">
         <div className="header-inner">
           <div className="brand-block compact">
-            <div className="brand-mark small">OK</div>
+            {data.company.logoDataUrl
+              ? <img className="brand-company-logo" src={data.company.logoDataUrl} alt={`${data.company.name} logosu`} />
+              : <div className="brand-mark small">OK</div>}
             <div className="header-brand-copy"><h1>{data.company.name}</h1><p>Ortak Kasa · Buluta bağlı</p></div>
           </div>
           <button className="header-settings" type="button" onClick={() => setSettingsOpen(true)} aria-label="Ayarlar">
@@ -385,6 +535,14 @@ export function Dashboard({
               </div>
             </div>
 
+            {computed.overdueJobs.length > 0 && (
+              <button className="overdue-card" type="button" onClick={() => setTab("jobs")}>
+                <span className="row-icon rose"><TimerReset size={21} /></span>
+                <span><strong>{computed.overdueJobs.length} vadesi geçmiş iş</strong><small>Toplam gecikmiş alacak {money(computed.overdueReceivables)}</small></span>
+                <b>İşleri gör</b>
+              </button>
+            )}
+
             <div className="two-column">
               <Panel title="Bekleyen işler" subtitle="Kalan borç sıfırlanana kadar takip edilir" badge={computed.openJobs.length}>
                 {computed.openJobs.length ? computed.openJobs.slice(0, 6).map((job) => (
@@ -401,6 +559,27 @@ export function Dashboard({
                 {recentMovements.length ? recentMovements.map((item) => <MovementRow key={`${item.type}-${item.id}`} item={item} />) : <Empty icon={ReceiptText} text="Bu dönemde hareket yok." />}
               </Panel>
             </div>
+
+            <section className="settlement-card">
+              <header className="settlement-head">
+                <span className="row-icon gold"><Calculator size={21} /></span>
+                <div><strong>Ortak hesaplaşması</strong><small>{range.label} için gelir, gider, araç payı ve avanslara göre</small></div>
+              </header>
+              <div className="settlement-summary">
+                <SummaryBox label="Kasa geliri − gider" value={computed.income - computed.expense} />
+                <SummaryBox label="Araç / servis payı" value={settlement.vehicleTotal} tone="warning" />
+                <SummaryBox label="Eşit bölünecek havuz" value={settlement.partnershipPool} tone={settlement.partnershipPool >= 0 ? "positive" : "warning"} />
+              </div>
+              <div className="settlement-rows">
+                {settlement.rows.map(({ partner, vehicleFee, advance, share, settlement: amount }) => (
+                  <div className="settlement-row" key={partner.id}>
+                    <span><strong>{partner.name}</strong><small>Eşit pay {money(share)} + araç {money(vehicleFee)} − avans {money(advance)}</small></span>
+                    <b className={amount < 0 ? "negative" : "positive"}>{money(amount)}</b>
+                  </div>
+                ))}
+              </div>
+              <p className="settlement-note">Formül: dönem kasa geliri − gider − araç/servis payları eşit bölünür; araç payı ilgili ortağa eklenir, aldığı avans kendi payından düşülür. Aylık hesap için üstten “Ay” seçin.</p>
+            </section>
 
             {computed.vehicleFees > 0 && (
               <button className="vehicle-summary" type="button" onClick={() => setTab("vehicles")}>
@@ -522,12 +701,21 @@ export function Dashboard({
       <PaymentDialog job={paymentJob} busy={busy} onClose={() => setPaymentJob(null)} onInvalid={(message) => notify(message, "error")} onSave={(jobId, amountCents, paidDate, note) => perform(() => onAddPayment(jobId, amountCents, paidDate, note), "Ödeme kasaya işlendi ve kalan borç güncellendi.", () => setPaymentJob(null))} />
       <CustomerHistoryModal
         customerName={customerOpen}
-        jobs={data.jobs}
-        cashEntries={data.cashEntries}
+        data={data}
+        today={today}
+        busy={busy}
         onClose={() => setCustomerOpen(null)}
         onPay={(job) => { setCustomerOpen(null); setPaymentJob(job); }}
+        onInvalid={(message) => notify(message, "error")}
+        onShareStatement={(customerName) => void exportCustomerStatement(customerName)}
+        onCollect={(customerName, amountCents, paidDate, note) =>
+          perform(
+            () => onCollectCustomer(customerName, amountCents, paidDate, note),
+            "Tahsilat işlendi. Açık borçları aşan kısım müşteri avansı olarak saklandı.",
+          )
+        }
       />
-      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} profile={profile} data={data} onLogout={onLogout} notify={notify} />
+      <SettingsModal open={settingsOpen} busy={busy} onClose={() => setSettingsOpen(false)} profile={profile} data={data} onSaveCompany={onSaveCompany} onLogout={onLogout} notify={notify} />
     </div>
   );
 }
@@ -549,16 +737,16 @@ function Panel({ title, subtitle, badge, children }: { title?: string; subtitle?
 }
 
 function CompactJob({ job, today, onPaid, onCustomer }: { job: Job; today: string; onPaid: () => void; onCustomer: () => void }) {
-  const carried = job.plannedDate < today;
+  const days = overdueDays(job, today);
   const remaining = jobRemaining(job);
   return (
-    <div className="list-row">
-      <span className="row-icon gold"><BriefcaseBusiness size={20} /></span>
+    <div className={`list-row ${days > 0 ? "overdue-row" : ""}`}>
+      <span className={`row-icon ${days > 0 ? "rose" : "gold"}`}><BriefcaseBusiness size={20} /></span>
       <button className="row-copy row-copy-button" type="button" onClick={onCustomer}>
         <strong>{job.customerName}</strong>
-        <small>{job.title}{carried ? " · Bugüne devretti" : ""}</small>
+        <small>{job.title}{days > 0 ? ` · ${days} gün gecikti` : job.status === "partial" ? " · Kısmi ödendi" : ""}</small>
       </button>
-      <span className="row-end"><b>{money(remaining)}</b><button type="button" onClick={onPaid}>Ödeme al</button></span>
+      <span className="row-end"><b className={days > 0 ? "negative" : ""}>{money(remaining)}</b><button type="button" onClick={onPaid}>Ödeme al</button></span>
     </div>
   );
 }
@@ -591,16 +779,16 @@ function CashRow({ entry, onDelete }: { entry: CashEntry; onDelete: () => void }
 
 function JobCard({ job, today, onPaid, onCustomer, onDelete }: { job: Job; today: string; onPaid: () => void; onCustomer: () => void; onDelete: () => void }) {
   const open = job.status !== "paid";
-  const carried = open && job.plannedDate < today;
+  const days = overdueDays(job, today);
   const paid = jobPaid(job);
   const remaining = jobRemaining(job);
-  const statusText = job.status === "paid" ? "Tamamlandı" : job.status === "partial" ? "Kısmi ödendi" : carried ? "Bugüne devretti" : "Ödeme bekliyor";
+  const statusText = job.status === "paid" ? "Tamamlandı" : days > 0 ? `${days} gün gecikti` : job.status === "partial" ? "Kısmi ödendi" : "Ödeme bekliyor";
 
   return (
     <article className="job-card clickable-card" onClick={onCustomer}>
       <div className="job-top">
         <div>
-          <div className="job-title-line"><h3>{job.customerName}</h3><span className={`status-badge ${job.status === "paid" ? "paid" : "waiting"}`}>{statusText}</span></div>
+          <div className="job-title-line"><h3>{job.customerName}</h3><span className={`status-badge ${job.status === "paid" ? "paid" : days > 0 ? "overdue" : "waiting"}`}>{statusText}</span></div>
           <p>{job.title}</p>
         </div>
         <strong>{money(job.amountCents)}</strong>
@@ -628,54 +816,111 @@ function JobCard({ job, today, onPaid, onCustomer, onDelete }: { job: Job; today
 
 function CustomerHistoryModal({
   customerName,
-  jobs,
-  cashEntries,
+  data,
+  today,
+  busy,
   onClose,
   onPay,
+  onCollect,
+  onShareStatement,
+  onInvalid,
 }: {
   customerName: string | null;
-  jobs: Job[];
-  cashEntries: CashEntry[];
+  data: CompanyData;
+  today: string;
+  busy: boolean;
   onClose: () => void;
   onPay: (job: Job) => void;
+  onCollect: (customerName: string, amountCents: number, paidDate: string, note: string) => Promise<void>;
+  onShareStatement: (customerName: string) => void;
+  onInvalid: (message: string) => void;
 }) {
   const key = customerName ? normalizedCustomer(customerName) : "";
-  const customerJobs = jobs
+  const customerJobs = data.jobs
     .filter((job) => normalizedCustomer(job.customerName) === key)
     .sort((a, b) => b.plannedDate.localeCompare(a.plannedDate));
-
   const billed = customerJobs.reduce((sum, job) => sum + job.amountCents, 0);
   const paid = customerJobs.reduce((sum, job) => sum + jobPaid(job), 0);
   const remaining = Math.max(0, billed - paid);
+  const credit = customerName ? customerCredit(data, customerName) : 0;
   const jobIds = new Set(customerJobs.map((job) => job.id));
-  const payments = cashEntries
-    .filter((entry) => entry.kind === "income" && entry.jobId && jobIds.has(entry.jobId))
+  const payments = data.cashEntries
+    .filter((entry) => entry.kind === "income" && normalizedCustomer(entry.counterparty) === key && (entry.jobId ? jobIds.has(entry.jobId) : entry.category === "Müşteri avansı"))
     .sort((a, b) => b.entryDate.localeCompare(a.entryDate));
 
+  const collect = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!customerName) return;
+    const form = event.currentTarget;
+    const values = Object.fromEntries(new FormData(form).entries());
+    const amountCents = parseMoney(String(values.amount));
+    if (amountCents === null) {
+      onInvalid("Geçerli bir tahsilat tutarı yazın.");
+      return;
+    }
+    void onCollect(customerName, amountCents, String(values.paidDate), String(values.note ?? ""));
+    form.reset();
+  };
+
   return (
-    <Modal open={Boolean(customerName)} onClose={onClose} title={customerName ?? "Müşteri"} description="Geçmiş işler, tahsilatlar ve kalan bakiye">
+    <Modal open={Boolean(customerName)} onClose={onClose} title={customerName ?? "Müşteri"} description="Geçmiş işler, tahsilatlar, vade ve müşteri bakiyesi">
       <div className="customer-history">
-        <div className="customer-summary-grid">
+        <div className="customer-summary-grid four">
           <SummaryBox label="Toplam iş" value={billed} />
-          <SummaryBox label="Alınan" value={paid} tone="positive" />
+          <SummaryBox label="İşlere işlenen" value={paid} tone="positive" />
           <SummaryBox label="Kalan borç" value={remaining} tone="warning" />
+          <SummaryBox label="Müşteri avansı" value={credit} tone="positive" />
         </div>
+
+        {customerName && (
+          <div className="customer-statement-actions">
+            <button className="button button-primary full" type="button" onClick={() => onShareStatement(customerName)}>
+              <MessageCircle size={18} /> WhatsApp / PDF hesap ekstresi
+            </button>
+          </div>
+        )}
+
+        {customerName && (
+          <form className="customer-collect-card" onSubmit={collect}>
+            <div className="customer-collect-head">
+              <span className="row-icon mint"><HandCoins size={20} /></span>
+              <span>
+                <strong>Toplam bakiyeden tahsilat al</strong>
+                <small>Ödeme en eski açık borçtan başlar. Borcu aşan tutar müşteri avansı olur ve sonraki işe otomatik düşer.</small>
+              </span>
+            </div>
+            <div className="customer-collect-grid">
+              <Field label="Tahsil edilen (₺)" htmlFor="customer-collect-amount"><input id="customer-collect-amount" name="amount" required inputMode="decimal" placeholder="0,00" /></Field>
+              <Field label="Ödeme tarihi" htmlFor="customer-collect-date"><input id="customer-collect-date" name="paidDate" type="date" required defaultValue={localDateKey()} /></Field>
+            </div>
+            <Field label="Not (isteğe bağlı)" htmlFor="customer-collect-note"><textarea id="customer-collect-note" name="note" rows={2} maxLength={180} placeholder="Örn. EFT / nakit tahsilat" /></Field>
+            <div className="customer-collect-info"><span>Dağıtım sırası</span><strong>En eski borç → yeni borç → fazla tutar avans</strong></div>
+            <button className="button button-income full" type="submit" disabled={busy}><HandCoins size={18} /> {busy ? "Tahsilat işleniyor…" : "Toplam tahsilatı kaydet"}</button>
+          </form>
+        )}
+
+        {remaining === 0 && customerJobs.length > 0 && (
+          <div className="success-box"><strong>Açık borç yok</strong><span>{credit > 0 ? `Müşterinin ${money(credit)} avansı sonraki işe otomatik uygulanacak.` : "Tüm işler tahsil edilmiş görünüyor."}</span></div>
+        )}
 
         <section>
           <h3 className="settings-title"><BriefcaseBusiness size={18} /> Geçmiş işler</h3>
           <div className="customer-history-list">
-            {customerJobs.map((job) => (
-              <div className="customer-history-row" key={job.id}>
-                <span>
-                  <strong>{job.title}</strong>
-                  <small>{shortDate(job.plannedDate)} · Toplam {money(job.amountCents)} · Alınan {money(jobPaid(job))}</small>
-                </span>
-                <span className="customer-history-end">
-                  <b>{job.status === "paid" ? "Kapandı" : `${money(jobRemaining(job))} kaldı`}</b>
-                  {job.status !== "paid" && <button type="button" onClick={() => onPay(job)}>Ödeme al</button>}
-                </span>
-              </div>
-            ))}
+            {customerJobs.map((job) => {
+              const days = overdueDays(job, today);
+              return (
+                <div className="customer-history-row" key={job.id}>
+                  <span>
+                    <strong>{job.title}</strong>
+                    <small>{shortDate(job.plannedDate)} · Toplam {money(job.amountCents)} · Alınan {money(jobPaid(job))}{job.creditAppliedCents > 0 ? ` · Avanstan ${money(job.creditAppliedCents)}` : ""}{days > 0 ? ` · ${days} gün gecikti` : ""}</small>
+                  </span>
+                  <span className="customer-history-end">
+                    <b className={days > 0 ? "negative" : ""}>{job.status === "paid" ? "Kapandı" : `${money(jobRemaining(job))} kaldı`}</b>
+                    {job.status !== "paid" && <button type="button" onClick={() => onPay(job)}>Bu işe ödeme al</button>}
+                  </span>
+                </div>
+              );
+            })}
             {!customerJobs.length && <Empty icon={BriefcaseBusiness} text="Bu müşteriye ait iş bulunamadı." />}
           </div>
         </section>
@@ -685,8 +930,8 @@ function CustomerHistoryModal({
           <div className="customer-history-list">
             {payments.map((entry) => (
               <div className="customer-history-row" key={entry.id}>
-                <span><strong>{money(entry.amountCents)}</strong><small>{shortDate(entry.entryDate)} · {entry.note || "İş ödemesi"}</small></span>
-                <b className="positive">Tahsil edildi</b>
+                <span><strong>{money(entry.amountCents)}</strong><small>{shortDate(entry.entryDate)} · {entry.note || entry.category}</small></span>
+                <b className="positive">{entry.category}</b>
               </div>
             ))}
             {!payments.length && <Empty icon={ReceiptText} text="Henüz ödeme kaydı yok." />}
@@ -733,7 +978,52 @@ function MobileNav({ tab, onChange }: { tab: Tab; onChange: (tab: Tab) => void }
   return <nav className="mobile-nav" aria-label="Uygulama bölümleri">{navItems.map(({ id, label, icon: IconComponent }) => <button key={id} className={tab === id ? "active" : ""} type="button" onClick={() => onChange(id)}><IconComponent size={20} /><span>{label}</span></button>)}</nav>;
 }
 
-function SettingsModal({ open, onClose, profile, data, onLogout, notify }: { open: boolean; onClose: () => void; profile: UserProfile; data: CompanyData; onLogout: () => Promise<void>; notify: (message: string, tone?: "success" | "error" | "info") => void }) {
+function SettingsModal({
+  open,
+  busy,
+  onClose,
+  profile,
+  data,
+  onSaveCompany,
+  onLogout,
+  notify,
+}: {
+  open: boolean;
+  busy: boolean;
+  onClose: () => void;
+  profile: UserProfile;
+  data: CompanyData;
+  onSaveCompany: (values: CompanySettingsInput) => Promise<void>;
+  onLogout: () => Promise<void>;
+  notify: (message: string, tone?: "success" | "error" | "info") => void;
+}) {
+  const owner = data.company.ownerUid === profile.uid;
+  const [logoBusy, setLogoBusy] = useState(false);
+  const [values, setValues] = useState<CompanySettingsInput>({
+    name: data.company.name,
+    phone: data.company.phone ?? "",
+    email: data.company.email ?? "",
+    address: data.company.address ?? "",
+    taxOffice: data.company.taxOffice ?? "",
+    taxNumber: data.company.taxNumber ?? "",
+    logoDataUrl: data.company.logoDataUrl ?? "",
+  });
+
+  useEffect(() => {
+    if (!open) return;
+    setValues({
+      name: data.company.name,
+      phone: data.company.phone ?? "",
+      email: data.company.email ?? "",
+      address: data.company.address ?? "",
+      taxOffice: data.company.taxOffice ?? "",
+      taxNumber: data.company.taxNumber ?? "",
+      logoDataUrl: data.company.logoDataUrl ?? "",
+    });
+  }, [open, data.company.name, data.company.phone, data.company.email, data.company.address, data.company.taxOffice, data.company.taxNumber, data.company.logoDataUrl]);
+
+  const setField = (field: keyof CompanySettingsInput, value: string) => setValues((current) => ({ ...current, [field]: value }));
+
   const copyCode = async () => {
     try {
       await navigator.clipboard.writeText(data.company.inviteCode);
@@ -743,18 +1033,92 @@ function SettingsModal({ open, onClose, profile, data, onLogout, notify }: { ope
     }
   };
 
+  const chooseLogo = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setLogoBusy(true);
+    try {
+      setField("logoDataUrl", await compressLogo(file));
+      notify("Logo hazırlandı. Kaydet butonuna basınca firma bilgilerine eklenecek.", "success");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Logo işlenemedi.", "error");
+    } finally {
+      setLogoBusy(false);
+      event.target.value = "";
+    }
+  };
+
+  const save = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    try {
+      await onSaveCompany(values);
+      notify("Firma bilgileri kaydedildi. Yeni PDF ve ekstrelerde bu logo/bilgiler kullanılacak.", "success");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Firma bilgileri kaydedilemedi.", "error");
+    }
+  };
+
   return (
-    <Modal open={open} onClose={onClose} title="Ayarlar ve ortaklık" description="İkinci telefonu aynı kasaya bağlayın.">
+    <Modal open={open} onClose={onClose} title="Ayarlar ve firma bilgileri" description="Firma kimliği, ortaklık, logo ve işlem geçmişi">
       <div className="settings-stack">
+        <section className="company-settings-card">
+          <h3 className="settings-title"><Building2 size={18} /> Firma bilgileri ve PDF logosu</h3>
+          {owner ? (
+            <form className="form-stack" onSubmit={save}>
+              <div className="company-logo-row">
+                <div className="company-logo-preview">
+                  {values.logoDataUrl ? <img src={values.logoDataUrl} alt="Firma logosu" /> : <span>LOGO</span>}
+                </div>
+                <div className="company-logo-actions">
+                  <label className="button button-ghost file-button">
+                    {logoBusy ? "Logo hazırlanıyor…" : "Logo seç"}
+                    <input type="file" accept="image/*" onChange={(event) => void chooseLogo(event)} disabled={logoBusy || busy} />
+                  </label>
+                  {values.logoDataUrl && <button className="button button-danger-outline" type="button" onClick={() => setField("logoDataUrl", "")} disabled={busy}>Logoyu kaldır</button>}
+                  <small>Logo telefonda küçültülerek saklanır; iş raporu ve müşteri hesap ekstresinde kullanılır.</small>
+                </div>
+              </div>
+
+              <div className="form-grid">
+                <Field label="Firma adı" htmlFor="company-name"><input id="company-name" value={values.name} onChange={(event) => setField("name", event.target.value)} maxLength={80} required /></Field>
+                <Field label="Telefon" htmlFor="company-phone"><input id="company-phone" value={values.phone} onChange={(event) => setField("phone", event.target.value)} maxLength={40} inputMode="tel" placeholder="05xx xxx xx xx" /></Field>
+              </div>
+              <Field label="E-posta" htmlFor="company-email"><input id="company-email" value={values.email} onChange={(event) => setField("email", event.target.value)} maxLength={120} inputMode="email" placeholder="firma@ornek.com" /></Field>
+              <Field label="Adres" htmlFor="company-address"><textarea id="company-address" value={values.address} onChange={(event) => setField("address", event.target.value)} maxLength={240} rows={3} placeholder="Firma adresi" /></Field>
+              <div className="form-grid">
+                <Field label="Vergi dairesi" htmlFor="company-tax-office"><input id="company-tax-office" value={values.taxOffice} onChange={(event) => setField("taxOffice", event.target.value)} maxLength={80} /></Field>
+                <Field label="VKN / TCKN" htmlFor="company-tax-number"><input id="company-tax-number" value={values.taxNumber} onChange={(event) => setField("taxNumber", event.target.value)} maxLength={40} inputMode="numeric" /></Field>
+              </div>
+              <button className="button button-primary full" type="submit" disabled={busy || logoBusy}>{busy ? "Kaydediliyor…" : "Firma bilgilerini kaydet"}</button>
+            </form>
+          ) : (
+            <div className="info-box">Firma bilgileri ve logo yalnızca işletme sahibi tarafından değiştirilebilir. Kayıtlı bilgiler PDF'lerde otomatik kullanılır.</div>
+          )}
+        </section>
+
         <section className="invite-card">
           <span>Ortaklık kodu</span>
           <div><code>{data.company.inviteCode}</code><button className="icon-button" type="button" onClick={() => void copyCode()} aria-label="Kodu kopyala"><Copy size={19} /></button></div>
           <p>Ortağınız kendi hesabını açtıktan sonra “Kodla katıl” bölümüne bu kodu yazar.</p>
         </section>
+
         <section>
           <h3 className="settings-title"><Users size={18} /> Bağlı ortaklar</h3>
           <div className="member-list">{data.partners.map((partner) => <div className="member-row" key={partner.id}><span className="member-avatar">{partner.name.slice(0, 1).toUpperCase()}</span><span><strong>{partner.name}</strong><small>{partner.userId ? "Telefonu bağlı" : "Davet bekliyor"}</small></span><b className={partner.userId ? "active" : "waiting"}>{partner.userId ? "Aktif" : "Bekliyor"}</b></div>)}</div>
         </section>
+
+        <section>
+          <h3 className="settings-title"><History size={18} /> İşlem geçmişi</h3>
+          <div className="audit-list">
+            {data.auditLogs.length ? data.auditLogs.slice(0, 30).map((item) => (
+              <div className="audit-row" key={item.id}>
+                <span><strong>{item.actorName}</strong><small>{new Date(item.eventDate).toLocaleString("tr-TR")}</small></span>
+                <p>{item.summary}</p>
+              </div>
+            )) : <Empty icon={History} text="Henüz işlem geçmişi oluşmadı." />}
+          </div>
+        </section>
+
         <section className="cloud-card"><Cloud size={21} /><div><strong>Google Cloud senkronizasyonu</strong><p>İnternet varken iki telefondaki kayıtlar otomatik olarak aynı kalır.</p></div></section>
         <section className="account-row"><span className="row-icon neutral"><UserRound size={20} /></span><span><strong>{profile.displayName}</strong><small>{profile.email}</small></span></section>
         <button className="button button-logout full" type="button" onClick={() => void onLogout()}><LogOut size={18} /> Hesaptan çık</button>
