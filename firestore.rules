@@ -1,0 +1,131 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function isMember(companyId) {
+      return signedIn()
+        && exists(userPath())
+        && get(userPath()).data.companyId == companyId;
+    }
+
+    function isMemberAfter(companyId) {
+      return signedIn()
+        && getAfter(userPath()).data.companyId == companyId;
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && !exists(/databases/$(database)/documents/users/$(uid))
+        && request.resource.data.email is string
+        && request.resource.data.displayName is string
+        && request.resource.data.companyId is string
+        && request.resource.data.partnerId is string
+        && request.resource.data.inviteCode is string
+        && (
+          getAfter(/databases/$(database)/documents/companies/$(request.resource.data.companyId)).data.ownerUid == uid
+          || (
+            get(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.active == true
+            && get(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.companyId == request.resource.data.companyId
+            && get(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.partnerId == request.resource.data.partnerId
+          )
+        );
+
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName']);
+      allow delete: if false;
+    }
+
+    match /inviteCodes/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.active == true
+        && getAfter(/databases/$(database)/documents/companies/$(request.resource.data.companyId)).data.ownerUid == request.auth.uid
+        && isMemberAfter(request.resource.data.companyId);
+
+      allow update: if signedIn()
+        && resource.data.active == true
+        && request.resource.data.active == false
+        && request.resource.data.claimedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['active', 'claimedBy', 'claimedAt'])
+        && isMemberAfter(resource.data.companyId);
+      allow delete: if false;
+    }
+
+    match /companies/{companyId} {
+      allow read: if isMember(companyId);
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.inviteCode is string
+        && isMemberAfter(companyId);
+      allow update, delete: if false;
+
+      match /partners/{partnerId} {
+        allow read: if isMember(companyId);
+        allow create: if signedIn()
+          && getAfter(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid
+          && isMemberAfter(companyId);
+        allow update: if signedIn()
+          && resource.data.userId == null
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['userId', 'email', 'joinedAt'])
+          && isMemberAfter(companyId);
+        allow delete: if false;
+      }
+
+      match /cashEntries/{entryId} {
+        allow read: if isMember(companyId);
+        allow create: if isMember(companyId)
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.kind in ['income', 'expense']
+          && request.resource.data.amountCents is int
+          && request.resource.data.amountCents > 0
+          && request.resource.data.entryDate is string;
+        allow update, delete: if isMember(companyId);
+      }
+
+      match /advances/{advanceId} {
+        allow read: if isMember(companyId);
+        allow create: if isMember(companyId)
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.amountCents is int
+          && request.resource.data.amountCents > 0
+          && request.resource.data.entryDate is string
+          && exists(/databases/$(database)/documents/companies/$(companyId)/partners/$(request.resource.data.partnerId));
+        allow update, delete: if isMember(companyId);
+      }
+
+      match /jobs/{jobId} {
+        allow read: if isMember(companyId);
+        allow create: if isMember(companyId)
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.status == 'open'
+          && request.resource.data.amountCents is int
+          && request.resource.data.amountCents > 0
+          && request.resource.data.serviceFeeCents is int
+          && request.resource.data.serviceFeeCents >= 0
+          && request.resource.data.plannedDate is string;
+        allow update, delete: if isMember(companyId);
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
