@@ -253,44 +253,64 @@ export async function joinCompany(user: User, rawCode: string) {
   const inviteRef = doc(db, "inviteCodes", code);
   const userRef = doc(db, "users", user.uid);
 
-  await runTransaction(db, async (transaction) => {
-    const [inviteSnapshot, existingUser] = await Promise.all([
-      transaction.get(inviteRef),
-      transaction.get(userRef),
-    ]);
-    if (existingUser.exists()) throw new Error("Zaten bir ortaklığa bağlısınız.");
-    if (!inviteSnapshot.exists() || inviteSnapshot.data().active !== true) {
-      throw new Error("Kod bulunamadı veya daha önce kullanılmış.");
-    }
+  const [inviteSnapshot, existingUser] = await Promise.all([
+    getDoc(inviteRef),
+    getDoc(userRef),
+  ]);
 
-    const invite = inviteSnapshot.data() as { companyId: string; partnerId: string };
-    const partnerRef = doc(db, "companies", invite.companyId, "partners", invite.partnerId);
-    const partnerSnapshot = await transaction.get(partnerRef);
-    if (!partnerSnapshot.exists() || partnerSnapshot.data().userId) {
-      throw new Error("Bu ortaklıkta boş yer kalmamış.");
-    }
+  if (existingUser.exists()) throw new Error("Zaten bir ortaklığa bağlısınız.");
+  if (!inviteSnapshot.exists() || inviteSnapshot.data().active !== true) {
+    throw new Error("Kod bulunamadı veya daha önce kullanılmış.");
+  }
 
-    const partnerName = String(partnerSnapshot.data().name ?? user.displayName ?? "Ortak").slice(0, 50);
-    const now = serverTimestamp();
-    transaction.update(partnerRef, {
-      userId: user.uid,
-      email: user.email ?? "",
-      joinedAt: now,
-    });
-    transaction.update(inviteRef, {
-      active: false,
-      claimedBy: user.uid,
-      claimedAt: now,
-    });
-    transaction.set(userRef, {
-      email: user.email ?? "",
-      displayName: partnerName,
-      companyId: invite.companyId,
-      partnerId: invite.partnerId,
-      inviteCode: code,
-      createdAt: now,
-    });
+  const invite = inviteSnapshot.data() as { companyId: string; partnerId: string };
+  const partnerRef = doc(db, "companies", invite.companyId, "partners", invite.partnerId);
+  const now = serverTimestamp();
+  const fallbackName = clean(user.displayName ?? "Ortak", 50) || "Ortak";
+
+  const batch = writeBatch(db);
+  batch.set(userRef, {
+    email: user.email ?? "",
+    displayName: fallbackName,
+    companyId: invite.companyId,
+    partnerId: invite.partnerId,
+    inviteCode: code,
+    createdAt: now,
   });
+  batch.update(partnerRef, {
+    userId: user.uid,
+    email: user.email ?? "",
+    joinedAt: now,
+  });
+  batch.update(inviteRef, {
+    active: false,
+    claimedBy: user.uid,
+    claimedAt: now,
+  });
+
+  try {
+    await batch.commit();
+  } catch (error) {
+    const codeValue =
+      typeof error === "object" && error && "code" in error
+        ? String((error as { code: unknown }).code)
+        : "";
+    if (codeValue.includes("permission-denied")) {
+      throw new Error("Ortaklık kodu kullanılamadı. Kod daha önce kullanılmış olabilir; yeni kodla tekrar deneyin.");
+    }
+    throw error;
+  }
+
+  try {
+    const partnerSnapshot = await getDoc(partnerRef);
+    if (partnerSnapshot.exists()) {
+      const partnerName = clean(String(partnerSnapshot.data().name ?? fallbackName), 50) || fallbackName;
+      if (partnerName !== fallbackName) {
+        await setDoc(userRef, { displayName: partnerName }, { merge: true });
+      }
+    }
+  } catch {
+  }
 }
 
 export function subscribeCompany(
